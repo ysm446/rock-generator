@@ -181,6 +181,57 @@ struct GpuRaymarchPreview
 RaymarchPreviewCache g_raymarchPreviewCache;
 GpuRaymarchPreview g_gpuRaymarchPreview;
 
+struct MeshPreviewConstants
+{
+    float cameraPosition[4];
+    float cameraRight[4];
+    float cameraUp[4];
+    float cameraForward[4];
+    float projScaleX;
+    float projScaleY;
+    float panNdcX;
+    float panNdcY;
+    float nearPlane;
+    float farPlane;
+    float padding[2];
+};
+
+struct GpuMeshPreview
+{
+    int width = 0;
+    int height = 0;
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float fovDegrees = 0.0f;
+    float orbitDistance = 0.0f;
+    float zoom = 0.0f;
+    ImVec2 pan = ImVec2(0.0f, 0.0f);
+    uint64_t graphVersion = UINT64_MAX;
+    bool showSurface = false;
+    bool showWireframe = false;
+    ComPtr<ID3D12Resource> colorTarget;
+    ComPtr<ID3D12Resource> depthTarget;
+    ComPtr<ID3D12Resource> vertexBuffer;
+    ComPtr<ID3D12Resource> indexBuffer;
+    ComPtr<ID3D12Resource> edgeIndexBuffer;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvCpu{};
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvCpu{};
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu{};
+    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu{};
+    bool srvAllocated = false;
+    UINT vertexCount = 0;
+    UINT triIndexCount = 0;
+    UINT edgeIndexCount = 0;
+    D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_COMMON;
+};
+
+ComPtr<ID3D12RootSignature> g_meshPreviewRootSignature;
+ComPtr<ID3D12PipelineState> g_meshPreviewSurfacePso;
+ComPtr<ID3D12PipelineState> g_meshPreviewWirePso;
+ComPtr<ID3D12DescriptorHeap> g_meshPreviewRtvHeap;
+ComPtr<ID3D12DescriptorHeap> g_meshPreviewDsvHeap;
+GpuMeshPreview g_gpuMeshPreview;
+
 struct SdfComputeConstants
 {
     UINT resolution = 48;
@@ -555,6 +606,11 @@ std::filesystem::path SdfPreviewShaderPath()
 std::filesystem::path RaymarchPreviewShaderPath()
 {
     return ShaderPath("raymarch_preview_cs.hlsl");
+}
+
+std::filesystem::path MeshPreviewShaderPath()
+{
+    return ShaderPath("mesh_preview.hlsl");
 }
 
 void EvaluateGraph();
@@ -1267,6 +1323,86 @@ bool EnsureRaymarchComputePipeline(std::string* error)
     return true;
 }
 
+bool EnsureMeshPreviewPipeline(std::string* error)
+{
+    if (g_meshPreviewSurfacePso) return true;
+    if (!g_device) { if (error) *error = "D3D12 device not initialized"; return false; }
+
+    D3D12_ROOT_PARAMETER rootParam{};
+    rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParam.Constants.ShaderRegister = 0;
+    rootParam.Constants.RegisterSpace = 0;
+    rootParam.Constants.Num32BitValues = sizeof(MeshPreviewConstants) / sizeof(UINT);
+    rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = 1;
+    rsDesc.pParameters = &rootParam;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> sigBlob, errBlob;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &errBlob);
+    if (FAILED(hr))
+    {
+        if (error) *error = errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "Serialize mesh root sig failed";
+        return false;
+    }
+    hr = g_device->CreateRootSignature(0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(), IID_PPV_ARGS(&g_meshPreviewRootSignature));
+    if (FAILED(hr)) { if (error) *error = "Create mesh preview root sig failed"; return false; }
+
+    const std::filesystem::path shaderPath = MeshPreviewShaderPath();
+    UINT compileFlags = D3DCOMPILE_ENABLE_STRICTNESS;
+#if defined(_DEBUG)
+    compileFlags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+    ComPtr<ID3DBlob> vsBlob, psBlob, psEdgeBlob;
+    hr = D3DCompileFromFile(shaderPath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "VSMain", "vs_5_0", compileFlags, 0, &vsBlob, &errBlob);
+    if (FAILED(hr)) { if (error) *error = errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "Compile mesh VS failed"; return false; }
+    errBlob.Reset();
+    hr = D3DCompileFromFile(shaderPath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "PSSurface", "ps_5_0", compileFlags, 0, &psBlob, &errBlob);
+    if (FAILED(hr)) { if (error) *error = errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "Compile mesh PS failed"; return false; }
+    errBlob.Reset();
+    hr = D3DCompileFromFile(shaderPath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "PSEdge", "ps_5_0", compileFlags, 0, &psEdgeBlob, &errBlob);
+    if (FAILED(hr)) { if (error) *error = errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "Compile mesh edge PS failed"; return false; }
+
+    D3D12_INPUT_ELEMENT_DESC inputLayout[] =
+    {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = g_meshPreviewRootSignature.Get();
+    psoDesc.VS = {vsBlob->GetBufferPointer(), vsBlob->GetBufferSize()};
+    psoDesc.InputLayout = {inputLayout, 2};
+    psoDesc.SampleMask = UINT_MAX;
+    psoDesc.SampleDesc.Count = 1;
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    psoDesc.RasterizerState.FrontCounterClockwise = FALSE;
+    psoDesc.DepthStencilState.DepthEnable = TRUE;
+    psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    psoDesc.PS = {psBlob->GetBufferPointer(), psBlob->GetBufferSize()};
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    hr = g_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_meshPreviewSurfacePso));
+    if (FAILED(hr)) { if (error) *error = "Create mesh surface PSO failed"; return false; }
+
+    psoDesc.PS = {psEdgeBlob->GetBufferPointer(), psEdgeBlob->GetBufferSize()};
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    hr = g_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_meshPreviewWirePso));
+    if (FAILED(hr)) { if (error) *error = "Create mesh wire PSO failed"; return false; }
+
+    return true;
+}
+
 bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, const rock::SdfPipeline& pipeline, int resolution, rock::SdfPreviewStats& outStats, std::string* error)
 {
     if (!EnsureSdfComputePipeline(error))
@@ -1735,6 +1871,143 @@ bool EnsureGpuRaymarchTexture(int width, int height, std::string* error)
     }
 }
 
+bool EnsureMeshPreviewRenderTarget(int width, int height, std::string* error)
+{
+    if (g_gpuMeshPreview.colorTarget && g_gpuMeshPreview.width == width && g_gpuMeshPreview.height == height)
+        return true;
+
+    try
+    {
+        WaitForLastSubmittedFrame();
+        g_gpuMeshPreview.colorTarget.Reset();
+        g_gpuMeshPreview.depthTarget.Reset();
+        g_gpuMeshPreview.width = width;
+        g_gpuMeshPreview.height = height;
+        g_gpuMeshPreview.colorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+        if (!g_meshPreviewRtvHeap)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC desc{};
+            desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+            desc.NumDescriptors = 1;
+            ThrowIfFailed(g_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&g_meshPreviewRtvHeap)), "Create mesh RTV heap failed");
+            g_gpuMeshPreview.rtvCpu = g_meshPreviewRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        }
+        if (!g_meshPreviewDsvHeap)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC desc{};
+            desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+            desc.NumDescriptors = 1;
+            ThrowIfFailed(g_device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&g_meshPreviewDsvHeap)), "Create mesh DSV heap failed");
+            g_gpuMeshPreview.dsvCpu = g_meshPreviewDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        }
+        if (!g_gpuMeshPreview.srvAllocated)
+        {
+            AllocateSrvDescriptor(nullptr, &g_gpuMeshPreview.srvCpu, &g_gpuMeshPreview.srvGpu);
+            g_gpuMeshPreview.srvAllocated = true;
+        }
+
+        const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+
+        {
+            D3D12_CLEAR_VALUE clearVal{};
+            clearVal.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            const D3D12_RESOURCE_DESC desc = Texture2DResourceDesc(
+                static_cast<UINT>(width), static_cast<UINT>(height),
+                DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            ThrowIfFailed(g_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, &clearVal, IID_PPV_ARGS(&g_gpuMeshPreview.colorTarget)),
+                "Create mesh color RT failed");
+            g_device->CreateRenderTargetView(g_gpuMeshPreview.colorTarget.Get(), nullptr, g_gpuMeshPreview.rtvCpu);
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Texture2D.MipLevels = 1;
+            g_device->CreateShaderResourceView(g_gpuMeshPreview.colorTarget.Get(), &srvDesc, g_gpuMeshPreview.srvCpu);
+        }
+        {
+            D3D12_CLEAR_VALUE clearVal{};
+            clearVal.Format = DXGI_FORMAT_D32_FLOAT;
+            clearVal.DepthStencil.Depth = 1.0f;
+            const D3D12_RESOURCE_DESC desc = Texture2DResourceDesc(
+                static_cast<UINT>(width), static_cast<UINT>(height),
+                DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+            ThrowIfFailed(g_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearVal, IID_PPV_ARGS(&g_gpuMeshPreview.depthTarget)),
+                "Create mesh depth buffer failed");
+            D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
+            dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+            dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            g_device->CreateDepthStencilView(g_gpuMeshPreview.depthTarget.Get(), &dsvDesc, g_gpuMeshPreview.dsvCpu);
+        }
+        return true;
+    }
+    catch (const std::exception& ex)
+    {
+        if (error) *error = ex.what();
+        return false;
+    }
+}
+
+void UpdateMeshPreviewBuffers(const rock::MeshData& mesh)
+{
+    g_gpuMeshPreview.vertexBuffer.Reset();
+    g_gpuMeshPreview.indexBuffer.Reset();
+    g_gpuMeshPreview.edgeIndexBuffer.Reset();
+    g_gpuMeshPreview.vertexCount = 0;
+    g_gpuMeshPreview.triIndexCount = 0;
+    g_gpuMeshPreview.edgeIndexCount = 0;
+
+    if (mesh.vertices.empty()) return;
+
+    const D3D12_HEAP_PROPERTIES uploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+    D3D12_RANGE readRange{};
+    void* mapped = nullptr;
+
+    const UINT64 vbSize = mesh.vertices.size() * sizeof(rock::MeshVertex);
+    const D3D12_RESOURCE_DESC vbDesc = BufferResourceDesc(vbSize);
+    ThrowIfFailed(g_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE,
+        &vbDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&g_gpuMeshPreview.vertexBuffer)), "Create mesh VB failed");
+    g_gpuMeshPreview.vertexBuffer->Map(0, &readRange, &mapped);
+    std::memcpy(mapped, mesh.vertices.data(), static_cast<size_t>(vbSize));
+    g_gpuMeshPreview.vertexBuffer->Unmap(0, nullptr);
+    g_gpuMeshPreview.vertexCount = static_cast<UINT>(mesh.vertices.size());
+
+    if (!mesh.triangles.empty())
+    {
+        std::vector<UINT> indices;
+        indices.reserve(mesh.triangles.size() * 3);
+        for (const auto& tri : mesh.triangles) { indices.push_back(tri.a); indices.push_back(tri.b); indices.push_back(tri.c); }
+        const UINT64 ibSize = indices.size() * sizeof(UINT);
+        const D3D12_RESOURCE_DESC ibDesc = BufferResourceDesc(ibSize);
+        ThrowIfFailed(g_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE,
+            &ibDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&g_gpuMeshPreview.indexBuffer)), "Create mesh IB failed");
+        g_gpuMeshPreview.indexBuffer->Map(0, &readRange, &mapped);
+        std::memcpy(mapped, indices.data(), static_cast<size_t>(ibSize));
+        g_gpuMeshPreview.indexBuffer->Unmap(0, nullptr);
+        g_gpuMeshPreview.triIndexCount = static_cast<UINT>(indices.size());
+    }
+
+    if (!mesh.edges.empty())
+    {
+        std::vector<UINT> edgeIdx;
+        edgeIdx.reserve(mesh.edges.size() * 2);
+        for (const auto& e : mesh.edges) { edgeIdx.push_back(e.a); edgeIdx.push_back(e.b); }
+        const UINT64 ebSize = edgeIdx.size() * sizeof(UINT);
+        const D3D12_RESOURCE_DESC ebDesc = BufferResourceDesc(ebSize);
+        ThrowIfFailed(g_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE,
+            &ebDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&g_gpuMeshPreview.edgeIndexBuffer)), "Create mesh edge IB failed");
+        g_gpuMeshPreview.edgeIndexBuffer->Map(0, &readRange, &mapped);
+        std::memcpy(mapped, edgeIdx.data(), static_cast<size_t>(ebSize));
+        g_gpuMeshPreview.edgeIndexBuffer->Unmap(0, nullptr);
+        g_gpuMeshPreview.edgeIndexCount = static_cast<UINT>(edgeIdx.size());
+    }
+}
+
 bool RenderGpuRaymarchPreview(const ImVec2& min, const ImVec2& max, std::string* error)
 {
     if (!EnsureRaymarchComputePipeline(error))
@@ -2127,6 +2400,162 @@ void DrawMeshEdgePreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& 
     }
 }
 
+bool RenderGpuMeshPreview(const ImVec2& min, const ImVec2& max, bool showSurface, bool showWireframe, std::string* error)
+{
+    if (!showSurface && !showWireframe) return true;
+    if (!EnsureMeshPreviewPipeline(error)) return false;
+
+    const float viewportWidth = std::max(1.0f, max.x - min.x);
+    const float viewportHeight = std::max(1.0f, max.y - min.y);
+    const int targetWidth = std::clamp(static_cast<int>(viewportWidth), 160, 960);
+    const int targetHeight = std::clamp(static_cast<int>(viewportHeight), 120, 720);
+    if (!EnsureMeshPreviewRenderTarget(targetWidth, targetHeight, error)) return false;
+
+    const rock::MeshData& mesh = g_graph.Evaluation().previewMesh;
+    const uint64_t currentVersion = g_graph.Evaluation().version;
+    const bool meshDirty = (g_gpuMeshPreview.graphVersion != currentVersion || !g_gpuMeshPreview.vertexBuffer);
+    const bool viewportDirty =
+        g_gpuMeshPreview.yaw != g_viewport.yaw ||
+        g_gpuMeshPreview.pitch != g_viewport.pitch ||
+        g_gpuMeshPreview.fovDegrees != g_viewport.fovDegrees ||
+        g_gpuMeshPreview.orbitDistance != g_viewport.orbitDistance ||
+        g_gpuMeshPreview.zoom != g_viewport.zoom ||
+        g_gpuMeshPreview.pan.x != g_viewport.pan.x ||
+        g_gpuMeshPreview.pan.y != g_viewport.pan.y ||
+        g_gpuMeshPreview.showSurface != showSurface ||
+        g_gpuMeshPreview.showWireframe != showWireframe ||
+        g_gpuMeshPreview.colorState != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (!meshDirty && !viewportDirty) return true;
+
+    try
+    {
+        if (meshDirty)
+        {
+            UpdateMeshPreviewBuffers(mesh);
+            g_gpuMeshPreview.graphVersion = currentVersion;
+        }
+        if (g_gpuMeshPreview.vertexCount == 0) return true;
+
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> commandList;
+        ThrowIfFailed(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "Mesh preview allocator failed");
+        ThrowIfFailed(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commandList)), "Mesh preview CL failed");
+
+        if (g_gpuMeshPreview.colorState != D3D12_RESOURCE_STATE_RENDER_TARGET)
+        {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = g_gpuMeshPreview.colorTarget.Get();
+            b.Transition.StateBefore = g_gpuMeshPreview.colorState;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            commandList->ResourceBarrier(1, &b);
+        }
+
+        const float clearColor[] = {0.0f, 0.0f, 0.0f, 0.0f};
+        commandList->ClearRenderTargetView(g_gpuMeshPreview.rtvCpu, clearColor, 0, nullptr);
+        commandList->ClearDepthStencilView(g_gpuMeshPreview.dsvCpu, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        commandList->OMSetRenderTargets(1, &g_gpuMeshPreview.rtvCpu, FALSE, &g_gpuMeshPreview.dsvCpu);
+
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(targetWidth), static_cast<float>(targetHeight), 0.0f, 1.0f};
+        D3D12_RECT scissor{0, 0, targetWidth, targetHeight};
+        commandList->RSSetViewports(1, &vp);
+        commandList->RSSetScissorRects(1, &scissor);
+
+        const CameraBasis basis = BuildCameraBasis();
+        const float fovRad = std::clamp(g_viewport.fovDegrees, 15.0f, 90.0f) * 3.14159265f / 180.0f;
+        const float focalLength = 1.0f / std::tan(fovRad * 0.5f);
+        const float viewportSize = std::min(viewportWidth, viewportHeight);
+        const float scale = viewportSize * 1.20f * g_viewport.zoom;
+
+        MeshPreviewConstants constants{};
+        constants.cameraPosition[0] = basis.position.x; constants.cameraPosition[1] = basis.position.y; constants.cameraPosition[2] = basis.position.z;
+        constants.cameraRight[0]    = basis.right.x;    constants.cameraRight[1]    = basis.right.y;    constants.cameraRight[2]    = basis.right.z;
+        constants.cameraUp[0]       = basis.up.x;       constants.cameraUp[1]       = basis.up.y;       constants.cameraUp[2]       = basis.up.z;
+        constants.cameraForward[0]  = basis.forward.x;  constants.cameraForward[1]  = basis.forward.y;  constants.cameraForward[2]  = basis.forward.z;
+        constants.projScaleX = focalLength * scale * 2.0f / viewportWidth;
+        constants.projScaleY = focalLength * scale * 2.0f / viewportHeight;
+        constants.panNdcX    = g_viewport.pan.x * 2.0f / viewportWidth;
+        constants.panNdcY    = -g_viewport.pan.y * 2.0f / viewportHeight;
+        constants.nearPlane  = 0.05f;
+        constants.farPlane   = 100.0f;
+
+        D3D12_VERTEX_BUFFER_VIEW vbv{};
+        vbv.BufferLocation = g_gpuMeshPreview.vertexBuffer->GetGPUVirtualAddress();
+        vbv.SizeInBytes    = g_gpuMeshPreview.vertexCount * static_cast<UINT>(sizeof(rock::MeshVertex));
+        vbv.StrideInBytes  = static_cast<UINT>(sizeof(rock::MeshVertex));
+        commandList->IASetVertexBuffers(0, 1, &vbv);
+        commandList->SetGraphicsRootSignature(g_meshPreviewRootSignature.Get());
+        commandList->SetGraphicsRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
+
+        if (showSurface && g_gpuMeshPreview.triIndexCount > 0)
+        {
+            D3D12_INDEX_BUFFER_VIEW ibv{g_gpuMeshPreview.indexBuffer->GetGPUVirtualAddress(), g_gpuMeshPreview.triIndexCount * sizeof(UINT), DXGI_FORMAT_R32_UINT};
+            commandList->IASetIndexBuffer(&ibv);
+            commandList->SetPipelineState(g_meshPreviewSurfacePso.Get());
+            commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            commandList->DrawIndexedInstanced(g_gpuMeshPreview.triIndexCount, 1, 0, 0, 0);
+        }
+        if (showWireframe && g_gpuMeshPreview.edgeIndexCount > 0)
+        {
+            D3D12_INDEX_BUFFER_VIEW ibv{g_gpuMeshPreview.edgeIndexBuffer->GetGPUVirtualAddress(), g_gpuMeshPreview.edgeIndexCount * sizeof(UINT), DXGI_FORMAT_R32_UINT};
+            commandList->IASetIndexBuffer(&ibv);
+            commandList->SetPipelineState(g_meshPreviewWirePso.Get());
+            commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_LINELIST);
+            commandList->DrawIndexedInstanced(g_gpuMeshPreview.edgeIndexCount, 1, 0, 0, 0);
+        }
+
+        D3D12_RESOURCE_BARRIER toSrv{};
+        toSrv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toSrv.Transition.pResource = g_gpuMeshPreview.colorTarget.Get();
+        toSrv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        toSrv.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        toSrv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        commandList->ResourceBarrier(1, &toSrv);
+
+        ThrowIfFailed(commandList->Close(), "Close mesh preview CL failed");
+        ID3D12CommandList* cls[] = {commandList.Get()};
+        g_commandQueue->ExecuteCommandLists(1, cls);
+        const UINT64 fenceVal = ++g_fenceLastSignaledValue;
+        ThrowIfFailed(g_commandQueue->Signal(g_fence.Get(), fenceVal), "Signal mesh preview failed");
+        WaitForFenceValue(fenceVal);
+
+        g_gpuMeshPreview.yaw           = g_viewport.yaw;
+        g_gpuMeshPreview.pitch         = g_viewport.pitch;
+        g_gpuMeshPreview.fovDegrees    = g_viewport.fovDegrees;
+        g_gpuMeshPreview.orbitDistance = g_viewport.orbitDistance;
+        g_gpuMeshPreview.zoom          = g_viewport.zoom;
+        g_gpuMeshPreview.pan           = g_viewport.pan;
+        g_gpuMeshPreview.showSurface   = showSurface;
+        g_gpuMeshPreview.showWireframe = showWireframe;
+        g_gpuMeshPreview.colorState    = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        return true;
+    }
+    catch (const std::exception& ex)
+    {
+        if (error) *error = ex.what();
+        return false;
+    }
+}
+
+void DrawGpuMeshPreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max,
+                        const rock::MeshData& mesh, bool showSurface, bool showWireframe)
+{
+    std::string error;
+    if (!RenderGpuMeshPreview(min, max, showSurface, showWireframe, &error))
+    {
+        DrawMeshPreview(drawList, min, max, mesh, showSurface, false);
+        if (showWireframe) DrawMeshEdgePreview(drawList, min, max, mesh);
+        return;
+    }
+    if (g_gpuMeshPreview.srvAllocated && g_gpuMeshPreview.colorState == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+    {
+        drawList->PushClipRect(min, max, true);
+        drawList->AddImage(static_cast<ImTextureID>(g_gpuMeshPreview.srvGpu.ptr), min, max);
+        drawList->PopClipRect();
+    }
+}
+
 void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
 {
     (void)timeSeconds;
@@ -2147,14 +2576,11 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     if (g_ui.meshPreview)
     {
         const rock::OutputMeshSettings& outputMesh = g_graph.Settings().outputMesh;
-        DrawMeshPreview(drawList, min, max, g_graph.Evaluation().previewMesh, outputMesh.showSurface, false);
+        DrawGpuMeshPreview(drawList, min, max, g_graph.Evaluation().previewMesh,
+                           outputMesh.showSurface, outputMesh.showWireframe);
         if (outputMesh.showPoints)
         {
             DrawSurfacePointPreview(drawList, min, max, g_graph.Evaluation().previewSdf);
-        }
-        if (outputMesh.showWireframe)
-        {
-            DrawMeshEdgePreview(drawList, min, max, g_graph.Evaluation().previewMesh);
         }
     }
 
