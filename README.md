@@ -26,6 +26,7 @@ Windows desktop prototype for a node-based SDF rock generation tool.
 - Debug OBJ export to `exports/rock_debug.obj`
 - Interactive viewport orbit, pan, zoom, and reset controls
 - Node-stage preview: selecting graph nodes shows that generation stage in the viewport
+- JSON-driven UI themes in `data/ui_themes`, selectable from `設定 > UIテーマ`
 
 OpenVDB, real SDF evaluation, mesh extraction, and export nodes are intentionally left for later phases.
 

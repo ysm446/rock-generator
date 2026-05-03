@@ -1,0 +1,45 @@
+{
+  "id": "lithic_dark",
+  "name": "Lithic Dark",
+  "base": "dark",
+  "style": {
+    "windowRounding": 4.0,
+    "frameRounding": 3.0,
+    "grabRounding": 3.0,
+    "childRounding": 4.0,
+    "windowBorderSize": 1.0,
+    "frameBorderSize": 1.0,
+    "childBorderSize": 1.0,
+    "windowPadding": [8.0, 8.0],
+    "framePadding": [7.0, 4.0],
+    "itemSpacing": [8.0, 6.0],
+    "itemInnerSpacing": [6.0, 4.0]
+  },
+  "colors": {
+    "WindowBg": [0.10, 0.11, 0.11, 0.96],
+    "ChildBg": [0.12, 0.13, 0.13, 0.88],
+    "PopupBg": [0.10, 0.11, 0.11, 0.98],
+    "Border": [0.31, 0.34, 0.32, 0.55],
+    "MenuBarBg": [0.13, 0.14, 0.14, 1.0],
+    "FrameBg": [0.18, 0.19, 0.18, 0.95],
+    "FrameBgHovered": [0.25, 0.28, 0.25, 0.98],
+    "FrameBgActive": [0.30, 0.35, 0.31, 1.0],
+    "Header": [0.24, 0.28, 0.25, 0.92],
+    "HeaderHovered": [0.31, 0.38, 0.33, 0.96],
+    "HeaderActive": [0.37, 0.45, 0.39, 1.0],
+    "Button": [0.23, 0.25, 0.23, 0.94],
+    "ButtonHovered": [0.31, 0.37, 0.32, 0.98],
+    "ButtonActive": [0.39, 0.47, 0.41, 1.0],
+    "SliderGrab": [0.56, 0.67, 0.58, 0.95],
+    "SliderGrabActive": [0.68, 0.80, 0.70, 1.0]
+  },
+  "appColors": {
+    "viewportBg": [0.08, 0.09, 0.09, 1.0],
+    "viewportGrid": [0.24, 0.27, 0.25, 0.35],
+    "surfaceFill": [0.38, 0.48, 0.40, 0.29],
+    "surfaceWire": [0.80, 0.84, 0.75, 0.53],
+    "surfacePoint": [0.78, 0.84, 0.72, 0.82],
+    "accentText": [0.82, 0.87, 0.80, 1.0],
+    "mutedText": [0.54, 0.59, 0.56, 1.0]
+  }
+}

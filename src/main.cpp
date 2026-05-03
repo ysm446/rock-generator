@@ -21,6 +21,8 @@
 
 #include "node_graph.h"
 #include "obj_exporter.h"
+#include "ui/UiTheme.h"
+#include "Version.h"
 
 using Microsoft::WRL::ComPtr;
 namespace ed = ax::NodeEditor;
@@ -63,6 +65,8 @@ ed::EditorContext* g_nodeEditor = nullptr;
 bool g_nodePositionsInitialized = false;
 rock::NodeGraph g_graph = rock::NodeGraph::CreateDefaultRockGraph();
 std::string g_exportStatus = "No export yet";
+rock::UiThemeManager g_themeManager;
+rock::GraphId g_selectedNodeId = 0;
 
 struct UiState
 {
@@ -88,6 +92,16 @@ struct ViewportState
 };
 
 ViewportState g_viewport;
+
+std::wstring MakeWindowTitle()
+{
+    std::wstring title = L"Rock Generator ";
+    for (const char c : std::string(ROCK_GENERATOR_VERSION_STRING))
+    {
+        title.push_back(static_cast<wchar_t>(c));
+    }
+    return title;
+}
 
 void ThrowIfFailed(HRESULT hr, const char* message)
 {
@@ -348,6 +362,9 @@ ImVec2 RotatePoint(float x, float y, float z, float yaw, float pitch)
     return ImVec2(xz * perspective, yz * perspective);
 }
 
+ImU32 ColorToU32(const ImVec4& color);
+ImU32 ThemeColor(const std::string& name, const ImVec4& fallback);
+
 ImU32 SdfSliceColor(float sdf)
 {
     const float band = std::clamp(1.0f - std::fabs(sdf) / 0.045f, 0.0f, 1.0f);
@@ -379,8 +396,8 @@ void DrawSdfSliceOverlay(ImDrawList* drawList, const ImVec2& min, const ImVec2& 
     const ImVec2 panelMax(panelMin.x + panelSize, panelMin.y + panelSize);
     const float cellSize = panelSize / static_cast<float>(sdf.sliceResolution);
 
-    drawList->AddRectFilled(ImVec2(panelMin.x - 8.0f, panelMin.y - 28.0f), ImVec2(panelMax.x + 8.0f, panelMax.y + 8.0f), IM_COL32(18, 20, 21, 220), 6.0f);
-    drawList->AddText(ImVec2(panelMin.x, panelMin.y - 22.0f), IM_COL32(220, 224, 217, 255), "SDF Center Slice");
+    drawList->AddRectFilled(ImVec2(panelMin.x - 8.0f, panelMin.y - 28.0f), ImVec2(panelMax.x + 8.0f, panelMax.y + 8.0f), ThemeColor("panelBg", ImVec4(0.07f, 0.08f, 0.08f, 0.86f)), 6.0f);
+    drawList->AddText(ImVec2(panelMin.x, panelMin.y - 22.0f), ThemeColor("accentText", ImVec4(0.86f, 0.88f, 0.85f, 1.0f)), "SDF Center Slice");
 
     for (int y = 0; y < sdf.sliceResolution; ++y)
     {
@@ -393,7 +410,7 @@ void DrawSdfSliceOverlay(ImDrawList* drawList, const ImVec2& min, const ImVec2& 
         }
     }
 
-    drawList->AddRect(panelMin, panelMax, IM_COL32(142, 151, 146, 255), 0.0f, 0, 1.0f);
+    drawList->AddRect(panelMin, panelMax, ThemeColor("viewportGrid", ImVec4(0.56f, 0.59f, 0.57f, 1.0f)), 0.0f, 0, 1.0f);
 }
 
 void DrawSurfacePointPreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, const rock::SdfPreviewStats& sdf)
@@ -417,10 +434,8 @@ void DrawSurfacePointPreview(ImDrawList* drawList, const ImVec2& min, const ImVe
         }
 
         const float nearSurface = std::clamp(1.0f - std::fabs(point.sdf) / std::max(sdf.voxelSize, 0.0001f), 0.0f, 1.0f);
-        const int r = static_cast<int>(150.0f + nearSurface * 70.0f);
-        const int g = static_cast<int>(160.0f + nearSurface * 70.0f);
-        const int b = static_cast<int>(145.0f + nearSurface * 42.0f);
-        drawList->AddCircleFilled(screen, 1.35f, IM_COL32(r, g, b, 205));
+        const ImVec4 base = g_themeManager.AppColor("surfacePoint", ImVec4(0.78f, 0.84f, 0.72f, 0.82f));
+        drawList->AddCircleFilled(screen, 1.35f, ColorToU32(ImVec4(base.x, base.y, base.z, std::clamp(base.w + nearSurface * 0.12f, 0.0f, 1.0f))));
     }
 }
 
@@ -447,7 +462,7 @@ void DrawSurfaceWirePreview(ImDrawList* drawList, const ImVec2& min, const ImVec
             continue;
         }
 
-        drawList->AddLine(a, b, IM_COL32(205, 213, 190, 135), 1.0f);
+        drawList->AddLine(a, b, ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 1.0f);
     }
 }
 
@@ -480,8 +495,8 @@ void DrawSurfaceTrianglePreview(ImDrawList* drawList, const ImVec2& min, const I
             continue;
         }
 
-        drawList->AddTriangleFilled(a, b, c, IM_COL32(96, 119, 101, 74));
-        drawList->AddTriangle(a, b, c, IM_COL32(181, 191, 170, 82), 0.8f);
+        drawList->AddTriangleFilled(a, b, c, ThemeColor("surfaceFill", ImVec4(0.38f, 0.48f, 0.40f, 0.29f)));
+        drawList->AddTriangle(a, b, c, ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 0.8f);
     }
 }
 
@@ -495,9 +510,9 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     const float viewportSize = std::min(max.x - min.x, max.y - min.y);
     const float scale = viewportSize * 1.35f * g_viewport.zoom;
 
-    drawList->AddRectFilled(min, max, IM_COL32(22, 25, 28, 255));
+    drawList->AddRectFilled(min, max, ThemeColor("viewportBg", ImVec4(0.09f, 0.10f, 0.11f, 1.0f)));
 
-    const ImU32 gridColor = IM_COL32(60, 66, 70, 90);
+    const ImU32 gridColor = ThemeColor("viewportGrid", ImVec4(0.24f, 0.27f, 0.25f, 0.35f));
     for (int i = 1; i < 8; ++i)
     {
         const float x = min.x + (max.x - min.x) * (static_cast<float>(i) / 8.0f);
@@ -536,12 +551,12 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
 
     for (const auto& edge : edges)
     {
-        drawList->AddLine(projected[edge[0]], projected[edge[1]], IM_COL32(210, 216, 205, 255), 2.0f);
+        drawList->AddLine(projected[edge[0]], projected[edge[1]], ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 2.0f);
     }
 
     const std::string title = "SDF Preview: " + std::string(rock::ToString(g_graph.Preview()));
-    drawList->AddText(ImVec2(min.x + 16.0f, min.y + 14.0f), IM_COL32(220, 224, 217, 255), title.c_str());
-    drawList->AddText(ImVec2(min.x + 16.0f, min.y + 36.0f), IM_COL32(138, 151, 149, 255), "Debug triangles from dense SDF");
+    drawList->AddText(ImVec2(min.x + 16.0f, min.y + 14.0f), ThemeColor("accentText", ImVec4(0.86f, 0.88f, 0.85f, 1.0f)), title.c_str());
+    drawList->AddText(ImVec2(min.x + 16.0f, min.y + 36.0f), ThemeColor("mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)), "Debug triangles from dense SDF");
     DrawSdfSliceOverlay(drawList, min, max, g_graph.Evaluation().previewSdf);
 }
 
@@ -582,6 +597,49 @@ ImVec2 InitialNodePosition(rock::NodeKind kind)
 int ToGraphId(uintptr_t id)
 {
     return static_cast<int>(id);
+}
+
+void EvaluateWhenParameterEditEnds()
+{
+    if (ImGui::IsItemDeactivatedAfterEdit())
+    {
+        g_graph.Evaluate();
+    }
+}
+
+void LoadJapaneseFont(ImGuiIO& io)
+{
+    const char* fontPaths[] = {
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+        "C:\\Windows\\Fonts\\YuGothM.ttc",
+        "C:\\Windows\\Fonts\\msgothic.ttc",
+    };
+
+    for (const char* fontPath : fontPaths)
+    {
+        if (!std::filesystem::exists(fontPath))
+        {
+            continue;
+        }
+
+        ImFont* font = io.Fonts->AddFontFromFileTTF(fontPath, 18.0f, nullptr, io.Fonts->GetGlyphRangesJapanese());
+        if (font != nullptr)
+        {
+            return;
+        }
+    }
+
+    io.Fonts->AddFontDefault();
+}
+
+ImU32 ColorToU32(const ImVec4& color)
+{
+    return ImGui::ColorConvertFloat4ToU32(color);
+}
+
+ImU32 ThemeColor(const std::string& name, const ImVec4& fallback)
+{
+    return ColorToU32(g_themeManager.AppColor(name, fallback));
 }
 
 void DrawPinLabel(const rock::Pin& pin)
@@ -682,6 +740,7 @@ void DrawNodeGraph()
     if (ed::GetSelectedNodes(selectedNodes, 1) > 0)
     {
         const rock::GraphId selectedNodeId = ToGraphId(selectedNodes[0].Get());
+        g_selectedNodeId = selectedNodeId;
         if (const rock::Node* selectedNode = g_graph.FindNode(selectedNodeId))
         {
             if (g_graph.SetPreviewStage(rock::PreviewStageFor(selectedNode->kind)))
@@ -690,167 +749,226 @@ void DrawNodeGraph()
             }
         }
     }
+    else
+    {
+        g_selectedNodeId = 0;
+    }
 
     ed::End();
     ed::SetCurrentEditor(nullptr);
 }
 
-void DrawUi()
+bool DrawPropertyComboRow(const char* label, const char* id, int* value, const char* items)
 {
-    static const auto start = std::chrono::steady_clock::now();
-    const auto now = std::chrono::steady_clock::now();
-    const float timeSeconds = std::chrono::duration<float>(now - start).count();
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::TableSetColumnIndex(1);
+    ImGui::PushID(id);
+    ImGui::SetNextItemWidth(-1.0f);
+    const bool changed = ImGui::Combo("##value", value, items);
+    ImGui::PopID();
+    return changed;
+}
 
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
-    ImGui::Begin("Rock Generator Shell", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
+bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, const char* dirtyReason)
+{
+    bool editEnded = false;
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::TableSetColumnIndex(1);
 
-    if (ImGui::BeginMenuBar())
+    ImGui::PushID(id);
+    const float inputWidth = 76.0f;
+    const float sliderWidth = std::max(80.0f, ImGui::GetContentRegionAvail().x - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::SetNextItemWidth(sliderWidth);
+    if (ImGui::SliderFloat("##slider", value, minValue, maxValue, "%.3f"))
     {
-        if (ImGui::BeginMenu("File"))
-        {
-            ImGui::MenuItem("New");
-            ImGui::MenuItem("Open");
-            ImGui::MenuItem("Save");
-            ImGui::Separator();
-            if (ImGui::MenuItem("Exit"))
-            {
-                PostQuitMessage(0);
-            }
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Edit"))
-        {
-            ImGui::MenuItem("Undo", "Ctrl+Z", false, false);
-            ImGui::MenuItem("Redo", "Ctrl+Y", false, false);
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("View"))
-        {
-            ImGui::MenuItem("Mesh Preview", nullptr, &g_ui.meshPreview);
-            ImGui::MenuItem("SDF Raymarch Preview", nullptr, &g_ui.sdfPreview, false);
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Build"))
-        {
-            if (ImGui::MenuItem("Evaluate Graph"))
-            {
-                g_graph.Evaluate();
-            }
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("Export"))
-        {
-            if (ImGui::MenuItem("OBJ"))
-            {
-                if (g_graph.Evaluation().dirty)
-                {
-                    g_graph.Evaluate();
-                }
+        g_graph.MarkDirty(dirtyReason);
+    }
+    editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
 
-                std::string error;
-                const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_debug.obj";
-                if (rock::ExportDebugTrianglesObj(g_graph.Evaluation().finalSdf, exportPath, &error))
-                {
-                    g_exportStatus = "Exported " + exportPath.string();
-                }
-                else
-                {
-                    g_exportStatus = "Export failed: " + error;
-                }
-            }
-            ImGui::MenuItem("glTF", nullptr, false, false);
-            ImGui::EndMenu();
-        }
-        ImGui::EndMenuBar();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(inputWidth);
+    if (ImGui::InputFloat("##number", value, 0.0f, 0.0f, "%.3f"))
+    {
+        *value = std::clamp(*value, minValue, maxValue);
+        g_graph.MarkDirty(dirtyReason);
+    }
+    editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::PopID();
+    return editEnded;
+}
+
+bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minValue, int maxValue, const char* dirtyReason)
+{
+    bool editEnded = false;
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::TableSetColumnIndex(1);
+
+    ImGui::PushID(id);
+    const float inputWidth = 58.0f;
+    const float sliderWidth = std::max(80.0f, ImGui::GetContentRegionAvail().x - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::SetNextItemWidth(sliderWidth);
+    if (ImGui::SliderInt("##slider", value, minValue, maxValue))
+    {
+        g_graph.MarkDirty(dirtyReason);
+    }
+    editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
+
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(inputWidth);
+    if (ImGui::InputInt("##number", value, 0, 0))
+    {
+        *value = std::clamp(*value, minValue, maxValue);
+        g_graph.MarkDirty(dirtyReason);
+    }
+    editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::PopID();
+    return editEnded;
+}
+
+void DrawPropertiesPanel()
+{
+    const rock::Node* selectedNode = g_graph.FindNode(g_selectedNodeId);
+    if (selectedNode == nullptr)
+    {
+        ImGui::TextDisabled("ノードを選択してください");
+        ImGui::Spacing();
+        ImGui::TextWrapped("選択したノードの設定だけをここに表示します。");
+        return;
     }
 
-    const float menuHeight = ImGui::GetFrameHeight();
-    const ImVec2 content = ImGui::GetContentRegionAvail();
-    const float leftWidth = std::max(280.0f, content.x * 0.24f);
-    const float rightWidth = std::max(300.0f, content.x * 0.22f);
-    const float bottomHeight = std::max(150.0f, content.y * 0.22f);
-    const float topHeight = content.y - bottomHeight - 8.0f;
-
-    ImGui::BeginChild("Node Graph", ImVec2(leftWidth, topHeight), true);
-    ImGui::TextUnformatted("Node Graph");
-    ImGui::Separator();
-    DrawNodeGraph();
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-
-    ImGui::BeginChild("Viewport", ImVec2(content.x - leftWidth - rightWidth - 16.0f, topHeight), true);
-    const ImVec2 min = ImGui::GetCursorScreenPos();
-    const ImVec2 max(min.x + ImGui::GetContentRegionAvail().x, min.y + ImGui::GetContentRegionAvail().y);
-    DrawViewportCube(min, max, timeSeconds);
-    ImGui::Dummy(ImGui::GetContentRegionAvail());
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-
-    ImGui::BeginChild("Properties", ImVec2(rightWidth, topHeight), true);
-    ImGui::TextUnformatted("Properties");
+    ImGui::TextUnformatted(selectedNode->title.c_str());
+    ImGui::TextDisabled("%s", rock::ToString(selectedNode->kind).data());
     ImGui::Separator();
 
     rock::GraphSettings& settings = g_graph.Settings();
-    int primitive = static_cast<int>(settings.primitive.kind);
-    if (ImGui::Combo("Primitive", &primitive, "Sphere\0Box\0Capsule\0Ellipsoid\0Rock Blob\0"))
+    if (selectedNode->kind == rock::NodeKind::PrimitiveSdf && ImGui::BeginTable("PrimitivePropertyRows", 2, ImGuiTableFlags_SizingStretchProp))
     {
-        settings.primitive.kind = static_cast<rock::PrimitiveKind>(primitive);
-        g_graph.MarkDirty("Primitive changed");
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+        int primitive = static_cast<int>(settings.primitive.kind);
+        if (DrawPropertyComboRow("Primitive", "Primitive", &primitive, "Sphere\0Box\0Capsule\0Ellipsoid\0Rock Blob\0"))
+        {
+            settings.primitive.kind = static_cast<rock::PrimitiveKind>(primitive);
+            g_graph.MarkDirty("Primitive changed");
+            g_graph.Evaluate();
+        }
+
+        ImGui::EndTable();
+        return;
     }
 
-    if (ImGui::SliderFloat("Noise Amplitude", &settings.noise.amplitude, 0.0f, 2.0f))
+    if (selectedNode->kind == rock::NodeKind::NoiseWarp && ImGui::BeginTable("NoisePropertyRows", 2, ImGuiTableFlags_SizingStretchProp))
     {
-        g_graph.MarkDirty("Noise amplitude changed");
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+        if (DrawPropertyFloatRow("Amplitude", "NoiseAmplitude", &settings.noise.amplitude, 0.0f, 2.0f, "Noise amplitude changed"))
+        {
+            g_graph.Evaluate();
+        }
+        if (DrawPropertyFloatRow("Frequency", "NoiseFrequency", &settings.noise.frequency, 0.1f, 12.0f, "Noise frequency changed"))
+        {
+            g_graph.Evaluate();
+        }
+        if (DrawPropertyIntRow("Octaves", "NoiseOctaves", &settings.noise.octaves, 1, 8, "Noise octaves changed"))
+        {
+            g_graph.Evaluate();
+        }
+
+        ImGui::EndTable();
+        return;
     }
-    if (ImGui::SliderFloat("Noise Frequency", &settings.noise.frequency, 0.1f, 12.0f))
+
+    if (selectedNode->kind == rock::NodeKind::CrackField && ImGui::BeginTable("CrackPropertyRows", 2, ImGuiTableFlags_SizingStretchProp))
     {
-        g_graph.MarkDirty("Noise frequency changed");
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+        if (DrawPropertyFloatRow("Width", "CrackWidth", &settings.crack.width, 0.0f, 0.2f, "Crack width changed"))
+        {
+            g_graph.Evaluate();
+        }
+        if (DrawPropertyFloatRow("Depth", "CrackDepth", &settings.crack.depth, 0.0f, 1.0f, "Crack depth changed"))
+        {
+            g_graph.Evaluate();
+        }
+        if (DrawPropertyFloatRow("Roughness", "CrackRoughness", &settings.crack.roughness, 0.0f, 1.0f, "Crack roughness changed"))
+        {
+            g_graph.Evaluate();
+        }
+
+        ImGui::EndTable();
+        return;
     }
-    if (ImGui::SliderInt("Noise Octaves", &settings.noise.octaves, 1, 8))
+
+    if (selectedNode->kind == rock::NodeKind::OutputMesh)
     {
-        g_graph.MarkDirty("Noise octaves changed");
+        ImGui::TextWrapped("このノードは最終出力を表します。");
+        ImGui::Spacing();
+        if (ImGui::Button("Build Mesh"))
+        {
+            g_graph.Evaluate();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Export OBJ"))
+        {
+            if (g_graph.Evaluation().dirty)
+            {
+                g_graph.Evaluate();
+            }
+
+            std::string error;
+            const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_debug.obj";
+            if (rock::ExportDebugTrianglesObj(g_graph.Evaluation().finalSdf, exportPath, &error))
+            {
+                g_exportStatus = "Exported " + exportPath.string();
+            }
+            else
+            {
+                g_exportStatus = "Export failed: " + error;
+            }
+        }
+        ImGui::TextWrapped("%s", g_exportStatus.c_str());
     }
-    ImGui::Spacing();
-    if (ImGui::SliderFloat("Crack Width", &settings.crack.width, 0.0f, 0.2f))
-    {
-        g_graph.MarkDirty("Crack width changed");
-    }
-    if (ImGui::SliderFloat("Crack Depth", &settings.crack.depth, 0.0f, 1.0f))
-    {
-        g_graph.MarkDirty("Crack depth changed");
-    }
-    if (ImGui::SliderFloat("Crack Roughness", &settings.crack.roughness, 0.0f, 1.0f))
-    {
-        g_graph.MarkDirty("Crack roughness changed");
-    }
-    ImGui::Spacing();
-    ImGui::Separator();
+}
+
+void DrawStatsPanel()
+{
     const rock::EvaluationSummary& evaluation = g_graph.Evaluation();
     ImGui::Text("Graph Version: %llu", static_cast<unsigned long long>(evaluation.version));
     ImGui::TextColored(evaluation.dirty ? ImVec4(0.90f, 0.64f, 0.30f, 1.0f) : ImVec4(0.54f, 0.78f, 0.58f, 1.0f), "%s", evaluation.dirty ? "Dirty" : "Evaluated");
     ImGui::TextWrapped("%s", evaluation.status.c_str());
-    const rock::SdfPreviewStats& previewSdf = evaluation.previewSdf;
-    if (previewSdf.totalVoxels > 0)
-    {
-        ImGui::Spacing();
-        ImGui::Text("Preview Stage: %s", rock::ToString(evaluation.previewStage).data());
-        ImGui::Text("Dense SDF: %d^3", previewSdf.resolution);
-        ImGui::Text("Slice: %d x %d", previewSdf.sliceResolution, previewSdf.sliceResolution);
-        ImGui::Text("SDF Range: %.3f / %.3f", previewSdf.minSdf, previewSdf.maxSdf);
-        ImGui::Text("Fill: %.1f%%", previewSdf.fillRatio * 100.0f);
-        ImGui::Text("Volume: %.3f", previewSdf.estimatedVolume);
-        ImGui::Text("Surface Points: %zu", previewSdf.surfacePoints.size());
-        ImGui::Text("Surface Lines: %zu", previewSdf.surfaceSegments.size());
-        ImGui::Text("Surface Triangles: %zu", previewSdf.surfaceTriangles.size());
-    }
-    ImGui::EndChild();
 
-    ImGui::BeginChild("Asset Export", ImVec2(0.0f, bottomHeight), true);
-    ImGui::TextUnformatted("Asset / Bake / Export");
-    ImGui::Separator();
+    const rock::SdfPreviewStats& previewSdf = evaluation.previewSdf;
+    if (previewSdf.totalVoxels <= 0)
+    {
+        return;
+    }
+
+    ImGui::SeparatorText("Preview");
+    ImGui::Text("Stage: %s", rock::ToString(evaluation.previewStage).data());
+    ImGui::Text("Dense SDF: %d^3", previewSdf.resolution);
+    ImGui::Text("Slice: %d x %d", previewSdf.sliceResolution, previewSdf.sliceResolution);
+    ImGui::Text("SDF Range: %.3f / %.3f", previewSdf.minSdf, previewSdf.maxSdf);
+    ImGui::Text("Fill: %.1f%%", previewSdf.fillRatio * 100.0f);
+    ImGui::Text("Volume: %.3f", previewSdf.estimatedVolume);
+    ImGui::Text("Surface Points: %zu", previewSdf.surfacePoints.size());
+    ImGui::Text("Surface Lines: %zu", previewSdf.surfaceSegments.size());
+    ImGui::Text("Surface Triangles: %zu", previewSdf.surfaceTriangles.size());
+}
+
+void DrawAssetExportPanel()
+{
     ImGui::Columns(4, nullptr, false);
     ImGui::TextUnformatted("High mesh");
     ImGui::Text("%s", g_graph.Evaluation().dirty ? "needs evaluate" : "debug triangles");
@@ -887,10 +1005,190 @@ void DrawUi()
     }
     ImGui::TextWrapped("%s", g_exportStatus.c_str());
     ImGui::Columns(1);
-    ImGui::EndChild();
+}
 
-    (void)menuHeight;
+void DrawUi()
+{
+    static const auto start = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const float timeSeconds = std::chrono::duration<float>(now - start).count();
+    constexpr ImGuiWindowFlags shellFlags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_MenuBar;
+    constexpr ImGuiWindowFlags fixedPaneFlags =
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
+    ImGui::Begin("Rock Generator Shell", nullptr, shellFlags);
+
+    if (ImGui::BeginMenuBar())
+    {
+        if (ImGui::BeginMenu("ファイル"))
+        {
+            ImGui::MenuItem("新規", "Ctrl+N", false, false);
+            ImGui::MenuItem("開く", "Ctrl+O", false, false);
+            ImGui::MenuItem("保存", "Ctrl+S", false, false);
+            ImGui::MenuItem("名前を付けて保存", nullptr, false, false);
+            ImGui::Separator();
+            if (ImGui::MenuItem("終了"))
+            {
+                PostQuitMessage(0);
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("編集"))
+        {
+            ImGui::MenuItem("元に戻す", "Ctrl+Z", false, false);
+            ImGui::MenuItem("やり直し", "Ctrl+Y", false, false);
+            ImGui::Separator();
+            ImGui::MenuItem("コピー", "Ctrl+C", false, false);
+            ImGui::MenuItem("貼り付け", "Ctrl+V", false, false);
+            ImGui::MenuItem("削除", "Delete", false, false);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("表示"))
+        {
+            ImGui::MenuItem("Mesh Preview", nullptr, &g_ui.meshPreview);
+            ImGui::MenuItem("SDF Raymarch Preview", nullptr, &g_ui.sdfPreview, false);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("設定"))
+        {
+            if (ImGui::BeginMenu("UIテーマ"))
+            {
+                for (const rock::UiThemeInfo& themeInfo : g_themeManager.ThemeInfos())
+                {
+                    const bool selected = themeInfo.id == g_themeManager.CurrentThemeId();
+                    if (ImGui::MenuItem(themeInfo.name.c_str(), nullptr, selected))
+                    {
+                        g_themeManager.ApplyTheme(themeInfo.id);
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            ImGui::MenuItem("環境設定", nullptr, false, false);
+            ImGui::MenuItem("ショートカット設定", nullptr, false, false);
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("ビルド"))
+        {
+            if (ImGui::MenuItem("グラフを評価"))
+            {
+                g_graph.Evaluate();
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("エクスポート"))
+        {
+            if (ImGui::MenuItem("OBJ"))
+            {
+                if (g_graph.Evaluation().dirty)
+                {
+                    g_graph.Evaluate();
+                }
+
+                std::string error;
+                const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_debug.obj";
+                if (rock::ExportDebugTrianglesObj(g_graph.Evaluation().finalSdf, exportPath, &error))
+                {
+                    g_exportStatus = "Exported " + exportPath.string();
+                }
+                else
+                {
+                    g_exportStatus = "Export failed: " + error;
+                }
+            }
+            ImGui::MenuItem("glTF", nullptr, false, false);
+            ImGui::EndMenu();
+        }
+        ImGui::EndMenuBar();
+    }
+
+    const ImVec2 content = ImGui::GetContentRegionAvail();
+    const float statusBarHeight = ImGui::GetTextLineHeight() + 16.0f;
+    const float leftWidth = std::clamp(content.x * 0.24f, 260.0f, 420.0f);
+    const float rightWidth = std::clamp(content.x * 0.24f, 300.0f, 460.0f);
+    const float workHeight = std::max(260.0f, content.y - statusBarHeight);
+    const float viewportWidth = std::max(360.0f, content.x - leftWidth - rightWidth);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+    ImGui::BeginChild("Left Sidebar", ImVec2(leftWidth, workHeight), true, fixedPaneFlags);
+    if (ImGui::BeginTabBar("LeftSidebarTabs"))
+    {
+        if (ImGui::BeginTabItem("ノード"))
+        {
+            DrawNodeGraph();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("エクスポート"))
+        {
+            DrawAssetExportPanel();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+
+    ImGui::SameLine();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::BeginChild("Viewport", ImVec2(viewportWidth, workHeight), true, fixedPaneFlags);
+    const ImVec2 min = ImGui::GetCursorScreenPos();
+    const ImVec2 max(min.x + ImGui::GetContentRegionAvail().x, min.y + ImGui::GetContentRegionAvail().y);
+    DrawViewportCube(min, max, timeSeconds);
+    ImGui::Dummy(ImGui::GetContentRegionAvail());
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+
+    ImGui::SameLine();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+    ImGui::BeginChild("Right Sidebar", ImVec2(rightWidth, workHeight), true, fixedPaneFlags);
+    if (ImGui::BeginTabBar("RightSidebarTabs"))
+    {
+        if (ImGui::BeginTabItem("プロパティ"))
+        {
+            DrawPropertiesPanel();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("統計"))
+        {
+            DrawStatsPanel();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 4.0f));
+    ImGui::BeginChild("Status Bar", ImVec2(0.0f, statusBarHeight), true, fixedPaneFlags);
+    const rock::EvaluationSummary& evaluation = g_graph.Evaluation();
+    ImGui::Text("%s | %s | %s", evaluation.dirty ? "Dirty" : "Evaluated", rock::ToString(evaluation.previewStage).data(), g_exportStatus.c_str());
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+
+    ImGui::PopStyleVar(3);
+
     ImGui::End();
+    ImGui::PopStyleVar();
 }
 
 void RenderFrame()
@@ -981,7 +1279,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 
         RECT rect{0, 0, static_cast<LONG>(g_width), static_cast<LONG>(g_height)};
         AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-        g_hwnd = CreateWindowW(wc.lpszClassName, L"Rock Generator", WS_OVERLAPPEDWINDOW, 100, 100, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, wc.hInstance, nullptr);
+        const std::wstring windowTitle = MakeWindowTitle();
+        g_hwnd = CreateWindowW(wc.lpszClassName, windowTitle.c_str(), WS_OVERLAPPEDWINDOW, 100, 100, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_hwnd)
         {
             throw std::runtime_error("CreateWindow failed");
@@ -996,7 +1295,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        ImGui::StyleColorsDark();
+        LoadJapaneseFont(io);
+        g_themeManager.LoadThemes(std::filesystem::path("data") / "ui_themes");
+        g_themeManager.ApplyTheme("road_editor_dark");
 
         ImGui_ImplWin32_Init(g_hwnd);
         ImGui_ImplDX12_InitInfo dx12InitInfo{};
