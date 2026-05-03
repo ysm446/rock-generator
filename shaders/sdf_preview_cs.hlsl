@@ -2,8 +2,11 @@ cbuffer Settings : register(b0)
 {
     uint resolution;
     uint primitiveKind;
-    uint previewStage;
     uint noiseOctaves;
+    uint useNoise;
+    uint useCrack;
+    uint applyOutputIso;
+    uint padding0;
     float noiseAmplitude;
     float noiseFrequency;
     float crackWidth;
@@ -127,11 +130,11 @@ void main(uint3 id : SV_DispatchThreadID)
         -1.0 + float(id.z) * voxelSize);
 
     float sdf = primitive_sdf(p);
-    if (previewStage >= 1)
+    if (useNoise != 0)
         sdf = apply_noise(sdf, p);
-    if (previewStage >= 2)
+    if (useCrack != 0)
         sdf = apply_cracks(sdf, p);
-    if (previewStage >= 3)
+    if (applyOutputIso != 0)
         sdf -= isoValue;
 
     gSdf[grid_index(id.x, id.y, id.z)] = sdf;

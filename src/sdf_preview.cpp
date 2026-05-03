@@ -162,22 +162,21 @@ float ApplyCracks(float sdf, Vec3 p, const CrackSettings& crack)
     return std::max(sdf, crackSdf);
 }
 
-float EvaluateStageSdf(Vec3 p, const GraphSettings& settings, PreviewStage stage)
+float EvaluatePipelineSdf(Vec3 p, const GraphSettings& settings, const SdfPipeline& pipeline)
 {
     float sdf = PrimitiveSdf(p, settings.primitive.kind);
-    if (stage == PreviewStage::Primitive)
+
+    if (pipeline.useNoise)
     {
-        return sdf;
+        sdf = ApplyNoise(sdf, p, settings.noise);
     }
 
-    sdf = ApplyNoise(sdf, p, settings.noise);
-    if (stage == PreviewStage::Noise)
+    if (pipeline.useCrack)
     {
-        return sdf;
+        sdf = ApplyCracks(sdf, p, settings.crack);
     }
 
-    sdf = ApplyCracks(sdf, p, settings.crack);
-    if (stage == PreviewStage::Output)
+    if (pipeline.applyOutputIso)
     {
         sdf -= settings.outputMesh.isoValue;
     }
@@ -454,12 +453,12 @@ void BuildPreviewGeometry(SdfPreviewStats& stats, const std::vector<float>& sdfV
 }
 } // namespace
 
-float EvaluateSdfAt(const GraphSettings& settings, float x, float y, float z, PreviewStage stage)
+float EvaluateSdfAt(const GraphSettings& settings, const SdfPipeline& pipeline, float x, float y, float z)
 {
-    return EvaluateStageSdf({x, y, z}, settings, stage);
+    return EvaluatePipelineSdf({x, y, z}, settings, pipeline);
 }
 
-SdfPreviewStats BuildDenseSdfPreview(const GraphSettings& settings, int resolution, PreviewStage stage)
+SdfPreviewStats BuildDenseSdfPreview(const GraphSettings& settings, const SdfPipeline& pipeline, int resolution)
 {
     SdfPreviewStats stats;
     stats.resolution = std::max(8, resolution);
@@ -485,7 +484,7 @@ SdfPreviewStats BuildDenseSdfPreview(const GraphSettings& settings, int resoluti
             {
                 Vec3 p = GridPoint(x, y, z, stats.voxelSize);
 
-                float sdf = EvaluateStageSdf(p, settings, stage);
+                float sdf = EvaluatePipelineSdf(p, settings, pipeline);
                 sdfValues[GridIndex(x, y, z, stats.resolution)] = sdf;
 
                 stats.minSdf = std::min(stats.minSdf, sdf);

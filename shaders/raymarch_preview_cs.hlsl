@@ -3,8 +3,10 @@ cbuffer Settings : register(b0)
     uint width;
     uint height;
     uint primitiveKind;
-    uint previewStage;
     uint noiseOctaves;
+    uint useNoise;
+    uint useCrack;
+    uint applyOutputIso;
     float noiseAmplitude;
     float noiseFrequency;
     float crackWidth;
@@ -122,11 +124,11 @@ float apply_cracks(float sdf, float3 p)
 float evaluate_sdf(float3 p)
 {
     float sdf = primitive_sdf(p);
-    if (previewStage >= 1)
+    if (useNoise != 0)
         sdf = apply_noise(sdf, p);
-    if (previewStage >= 2)
+    if (useCrack != 0)
         sdf = apply_cracks(sdf, p);
-    if (previewStage >= 3)
+    if (applyOutputIso != 0)
         sdf -= isoValue;
     return sdf;
 }

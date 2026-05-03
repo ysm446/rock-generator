@@ -202,6 +202,13 @@ struct SdfPreviewStats
     std::vector<SurfaceTriangle> surfaceTriangles;
 };
 
+struct SdfPipeline
+{
+    bool useNoise = false;
+    bool useCrack = false;
+    bool applyOutputIso = false;
+};
+
 struct EvaluationSummary
 {
     uint64_t version = 0;
@@ -240,6 +247,9 @@ public:
     void ReplaceLinks(std::vector<Link> links);
     bool SetPreviewStage(PreviewStage stage);
     PreviewStage Preview() const;
+    SdfPipeline PipelineFor(PreviewStage stage) const;
+    SdfPipeline PreviewPipeline() const;
+    SdfPipeline FinalPipeline() const;
     void MarkDirty(std::string_view reason);
     void Evaluate();
     void EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend requestedBackend, ComputeBackend effectiveBackend, bool fallback);
@@ -248,6 +258,10 @@ private:
     GraphId AddNode(NodeKind kind, std::string title);
     GraphId AddPin(GraphId nodeId, PinKind kind, ValueType valueType, std::string label);
     void AddInitialLink(GraphId startPin, GraphId endPin);
+    const Node* FindFirstNode(NodeKind kind) const;
+    const Node* FindNodeByOutputPin(GraphId pinId) const;
+    const Node* FindUpstreamNode(const Node& node) const;
+    SdfPipeline PipelineTo(NodeKind targetKind) const;
 
     std::vector<Node> nodes_;
     std::vector<Link> links_;

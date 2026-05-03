@@ -267,6 +267,9 @@ bool NodeGraph::CreateLink(GraphId startPin, GraphId endPin)
         std::swap(startPin, endPin);
     }
 
+    std::erase_if(links_, [endPin](const Link& link) {
+        return link.endPin == endPin;
+    });
     links_.push_back({nextLinkId_++, startPin, endPin});
     MarkDirty("Link changed");
     return true;
@@ -313,36 +316,128 @@ PreviewStage NodeGraph::Preview() const
     return evaluation_.previewStage;
 }
 
+SdfPipeline NodeGraph::PipelineFor(PreviewStage stage) const
+{
+    switch (stage)
+    {
+    case PreviewStage::Primitive:
+        return PipelineTo(NodeKind::PrimitiveSdf);
+    case PreviewStage::Noise:
+        return PipelineTo(NodeKind::NoiseWarp);
+    case PreviewStage::Crack:
+        return PipelineTo(NodeKind::CrackField);
+    case PreviewStage::Output:
+    default:
+        return PipelineTo(NodeKind::OutputMesh);
+    }
+}
+
+SdfPipeline NodeGraph::PreviewPipeline() const
+{
+    return PipelineFor(evaluation_.previewStage);
+}
+
+SdfPipeline NodeGraph::FinalPipeline() const
+{
+    return PipelineFor(PreviewStage::Output);
+}
+
 void NodeGraph::MarkDirty(std::string_view reason)
 {
     evaluation_.dirty = true;
     evaluation_.status = std::string(reason);
 }
 
+const Node* NodeGraph::FindFirstNode(NodeKind kind) const
+{
+    const auto it = std::ranges::find_if(nodes_, [kind](const Node& node) {
+        return node.kind == kind;
+    });
+    return it != nodes_.end() ? &*it : nullptr;
+}
+
+const Node* NodeGraph::FindNodeByOutputPin(GraphId pinId) const
+{
+    for (const Node& node : nodes_)
+    {
+        if (std::ranges::any_of(node.outputs, [pinId](const Pin& pin) { return pin.id == pinId; }))
+        {
+            return &node;
+        }
+    }
+    return nullptr;
+}
+
+const Node* NodeGraph::FindUpstreamNode(const Node& node) const
+{
+    if (node.inputs.empty())
+    {
+        return nullptr;
+    }
+
+    const GraphId inputPin = node.inputs.front().id;
+    const auto linkIt = std::find_if(links_.rbegin(), links_.rend(), [inputPin](const Link& link) {
+        return link.endPin == inputPin;
+    });
+    if (linkIt == links_.rend())
+    {
+        return nullptr;
+    }
+
+    return FindNodeByOutputPin(linkIt->startPin);
+}
+
+SdfPipeline NodeGraph::PipelineTo(NodeKind targetKind) const
+{
+    SdfPipeline pipeline;
+    const Node* node = FindFirstNode(targetKind);
+    int guard = 0;
+    while (node != nullptr && guard++ < 16)
+    {
+        if (node->kind == NodeKind::NoiseWarp)
+        {
+            pipeline.useNoise = true;
+        }
+        else if (node->kind == NodeKind::CrackField)
+        {
+            pipeline.useCrack = true;
+        }
+        else if (node->kind == NodeKind::OutputMesh)
+        {
+            pipeline.applyOutputIso = true;
+        }
+        else if (node->kind == NodeKind::PrimitiveSdf)
+        {
+            break;
+        }
+
+        node = FindUpstreamNode(*node);
+    }
+    return pipeline;
+}
+
 void NodeGraph::Evaluate()
 {
     const int meshResolution = EffectiveMeshResolution(settings_.outputMesh);
+    const SdfPipeline previewPipeline = PreviewPipeline();
+    const SdfPipeline finalPipeline = FinalPipeline();
     evaluation_.requestedPreviewBackend = settings_.previewBackend;
     evaluation_.effectivePreviewBackend = ComputeBackend::Cpu;
     evaluation_.previewBackendFallback = settings_.previewBackend != ComputeBackend::Cpu;
-    evaluation_.previewSdf = BuildDenseSdfPreview(settings_, meshResolution, evaluation_.previewStage);
-    evaluation_.finalSdf = BuildDenseSdfPreview(settings_, meshResolution, PreviewStage::Output);
+    evaluation_.previewSdf = BuildDenseSdfPreview(settings_, previewPipeline, meshResolution);
+    evaluation_.finalSdf = BuildDenseSdfPreview(settings_, finalPipeline, meshResolution);
     evaluation_.previewMesh = BuildMeshFromSdf(evaluation_.previewSdf);
     evaluation_.finalMesh = BuildMeshFromSdf(evaluation_.finalSdf);
     ++evaluation_.version;
     evaluation_.dirty = false;
     evaluation_.status = std::format(
-        "{} preview [{}{}] -> {} -> noise {:.2f}/{:.2f}/{} -> crack {:.3f}/{:.2f}/{:.2f} -> mesh LOD {} / iso {:.3f} -> {} verts / {} tris",
+        "{} preview [{}{}] -> {}{}{} -> mesh LOD {} / iso {:.3f} -> {} verts / {} tris",
         ToString(evaluation_.previewStage),
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
         ToString(settings_.primitive.kind),
-        settings_.noise.amplitude,
-        settings_.noise.frequency,
-        settings_.noise.octaves,
-        settings_.crack.width,
-        settings_.crack.depth,
-        settings_.crack.roughness,
+        finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", settings_.noise.amplitude, settings_.noise.frequency, settings_.noise.octaves) : "",
+        finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", settings_.crack.width, settings_.crack.depth, settings_.crack.roughness) : "",
         settings_.outputMesh.lod,
         settings_.outputMesh.isoValue,
         evaluation_.previewMesh.vertices.size(),
@@ -352,27 +447,24 @@ void NodeGraph::Evaluate()
 void NodeGraph::EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend requestedBackend, ComputeBackend effectiveBackend, bool fallback)
 {
     const int meshResolution = EffectiveMeshResolution(settings_.outputMesh);
+    const SdfPipeline finalPipeline = FinalPipeline();
     evaluation_.requestedPreviewBackend = requestedBackend;
     evaluation_.effectivePreviewBackend = effectiveBackend;
     evaluation_.previewBackendFallback = fallback;
     evaluation_.previewSdf = std::move(previewSdf);
-    evaluation_.finalSdf = BuildDenseSdfPreview(settings_, meshResolution, PreviewStage::Output);
+    evaluation_.finalSdf = BuildDenseSdfPreview(settings_, finalPipeline, meshResolution);
     evaluation_.previewMesh = BuildMeshFromSdf(evaluation_.previewSdf);
     evaluation_.finalMesh = BuildMeshFromSdf(evaluation_.finalSdf);
     ++evaluation_.version;
     evaluation_.dirty = false;
     evaluation_.status = std::format(
-        "{} preview [{}{}] -> {} -> noise {:.2f}/{:.2f}/{} -> crack {:.3f}/{:.2f}/{:.2f} -> mesh LOD {} / iso {:.3f} -> {} verts / {} tris",
+        "{} preview [{}{}] -> {}{}{} -> mesh LOD {} / iso {:.3f} -> {} verts / {} tris",
         ToString(evaluation_.previewStage),
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
         ToString(settings_.primitive.kind),
-        settings_.noise.amplitude,
-        settings_.noise.frequency,
-        settings_.noise.octaves,
-        settings_.crack.width,
-        settings_.crack.depth,
-        settings_.crack.roughness,
+        finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", settings_.noise.amplitude, settings_.noise.frequency, settings_.noise.octaves) : "",
+        finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", settings_.crack.width, settings_.crack.depth, settings_.crack.roughness) : "",
         settings_.outputMesh.lod,
         settings_.outputMesh.isoValue,
         evaluation_.previewMesh.vertices.size(),

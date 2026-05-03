@@ -178,16 +178,18 @@ struct SdfComputeConstants
 {
     UINT resolution = 48;
     UINT primitiveKind = 0;
-    UINT previewStage = 0;
     UINT noiseOctaves = 4;
+    UINT useNoise = 0;
+    UINT useCrack = 0;
+    UINT applyOutputIso = 0;
+    UINT padding0 = 0;
     float noiseAmplitude = 0.0f;
     float noiseFrequency = 1.0f;
     float crackWidth = 0.0f;
     float crackDepth = 0.0f;
     float crackRoughness = 0.0f;
     float isoValue = 0.0f;
-    float padding1 = 0.0f;
-    float padding2 = 0.0f;
+    float padding1[2]{};
 };
 
 struct RaymarchComputeConstants
@@ -195,8 +197,10 @@ struct RaymarchComputeConstants
     UINT width = 0;
     UINT height = 0;
     UINT primitiveKind = 0;
-    UINT previewStage = 0;
     UINT noiseOctaves = 4;
+    UINT useNoise = 0;
+    UINT useCrack = 0;
+    UINT applyOutputIso = 0;
     float noiseAmplitude = 0.0f;
     float noiseFrequency = 1.0f;
     float crackWidth = 0.0f;
@@ -1159,7 +1163,7 @@ bool EnsureRaymarchComputePipeline(std::string* error)
     return true;
 }
 
-bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, rock::PreviewStage stage, int resolution, rock::SdfPreviewStats& outStats, std::string* error)
+bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, const rock::SdfPipeline& pipeline, int resolution, rock::SdfPreviewStats& outStats, std::string* error)
 {
     if (!EnsureSdfComputePipeline(error))
     {
@@ -1189,8 +1193,10 @@ bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, rock::PreviewSta
         SdfComputeConstants constants{};
         constants.resolution = clampedResolution;
         constants.primitiveKind = static_cast<UINT>(settings.primitive.kind);
-        constants.previewStage = static_cast<UINT>(stage);
         constants.noiseOctaves = static_cast<UINT>(std::clamp(settings.noise.octaves, 1, 8));
+        constants.useNoise = pipeline.useNoise ? 1U : 0U;
+        constants.useCrack = pipeline.useCrack ? 1U : 0U;
+        constants.applyOutputIso = pipeline.applyOutputIso ? 1U : 0U;
         constants.noiseAmplitude = settings.noise.amplitude;
         constants.noiseFrequency = settings.noise.frequency;
         constants.crackWidth = settings.crack.width;
@@ -1251,7 +1257,7 @@ void EvaluateGraph()
     rock::SdfPreviewStats gpuPreview;
     std::string error;
     const int meshResolution = std::clamp(settings.outputMesh.resolution / (1 << std::clamp(settings.outputMesh.lod, 0, 4)), 16, 96);
-    if (TryBuildGpuPreviewSdf(settings, g_graph.Preview(), meshResolution, gpuPreview, &error))
+    if (TryBuildGpuPreviewSdf(settings, g_graph.PreviewPipeline(), meshResolution, gpuPreview, &error))
     {
         g_graph.EvaluateWithPreview(std::move(gpuPreview), settings.previewBackend, rock::ComputeBackend::GpuPreview, false);
         return;
@@ -1486,12 +1492,12 @@ bool IntersectUnitBounds(Vec3 origin, Vec3 direction, float& nearT, float& farT)
     return farT > 0.0f;
 }
 
-Vec3 EstimateSdfNormal(const rock::GraphSettings& settings, Vec3 p, rock::PreviewStage stage)
+Vec3 EstimateSdfNormal(const rock::GraphSettings& settings, const rock::SdfPipeline& pipeline, Vec3 p)
 {
     constexpr float e = 0.012f;
-    const float dx = rock::EvaluateSdfAt(settings, p.x + e, p.y, p.z, stage) - rock::EvaluateSdfAt(settings, p.x - e, p.y, p.z, stage);
-    const float dy = rock::EvaluateSdfAt(settings, p.x, p.y + e, p.z, stage) - rock::EvaluateSdfAt(settings, p.x, p.y - e, p.z, stage);
-    const float dz = rock::EvaluateSdfAt(settings, p.x, p.y, p.z + e, stage) - rock::EvaluateSdfAt(settings, p.x, p.y, p.z - e, stage);
+    const float dx = rock::EvaluateSdfAt(settings, pipeline, p.x + e, p.y, p.z) - rock::EvaluateSdfAt(settings, pipeline, p.x - e, p.y, p.z);
+    const float dy = rock::EvaluateSdfAt(settings, pipeline, p.x, p.y + e, p.z) - rock::EvaluateSdfAt(settings, pipeline, p.x, p.y - e, p.z);
+    const float dz = rock::EvaluateSdfAt(settings, pipeline, p.x, p.y, p.z + e) - rock::EvaluateSdfAt(settings, pipeline, p.x, p.y, p.z - e);
     return Normalize(Vec3(dx, dy, dz), Vec3(0.0f, 1.0f, 0.0f));
 }
 
@@ -1527,7 +1533,7 @@ void RebuildRaymarchPreviewCache(const ImVec2& min, const ImVec2& max)
 
     const CameraBasis basis = BuildCameraBasis();
     const rock::GraphSettings& settings = g_graph.Settings();
-    const rock::PreviewStage stage = g_graph.Preview();
+    const rock::SdfPipeline pipeline = g_graph.PreviewPipeline();
     const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.5f + g_viewport.pan.y);
     const float viewportSize = std::min(viewportWidth, viewportHeight);
     const float projectionScale = viewportSize * 1.20f * g_viewport.zoom;
@@ -1557,10 +1563,10 @@ void RebuildRaymarchPreviewCache(const ImVec2& min, const ImVec2& max)
             for (; step < 72 && t <= farT; ++step)
             {
                 const Vec3 p = Add(basis.position, Scale(direction, t));
-                const float sdf = rock::EvaluateSdfAt(settings, p.x, p.y, p.z, stage);
+                const float sdf = rock::EvaluateSdfAt(settings, pipeline, p.x, p.y, p.z);
                 if (std::fabs(sdf) < 0.0045f)
                 {
-                    const Vec3 normal = EstimateSdfNormal(settings, p, stage);
+                    const Vec3 normal = EstimateSdfNormal(settings, pipeline, p);
                     g_raymarchPreviewCache.pixels[static_cast<size_t>(y * g_raymarchPreviewCache.width + x)] = ShadeRaymarchHit(p, normal, direction, step);
                     break;
                 }
@@ -1680,8 +1686,11 @@ bool RenderGpuRaymarchPreview(const ImVec2& min, const ImVec2& max, std::string*
         constants.width = static_cast<UINT>(targetWidth);
         constants.height = static_cast<UINT>(targetHeight);
         constants.primitiveKind = static_cast<UINT>(settings.primitive.kind);
-        constants.previewStage = static_cast<UINT>(g_graph.Preview());
         constants.noiseOctaves = static_cast<UINT>(std::clamp(settings.noise.octaves, 1, 8));
+        const rock::SdfPipeline pipeline = g_graph.PreviewPipeline();
+        constants.useNoise = pipeline.useNoise ? 1U : 0U;
+        constants.useCrack = pipeline.useCrack ? 1U : 0U;
+        constants.applyOutputIso = pipeline.applyOutputIso ? 1U : 0U;
         constants.noiseAmplitude = settings.noise.amplitude;
         constants.noiseFrequency = settings.noise.frequency;
         constants.crackWidth = settings.crack.width;
@@ -2276,7 +2285,10 @@ void DrawNodeGraph()
             {
                 if (ed::AcceptNewItem(ImVec4(0.52f, 0.70f, 0.59f, 1.0f), 3.0f))
                 {
-                    g_graph.CreateLink(startPin, endPin);
+                    if (g_graph.CreateLink(startPin, endPin))
+                    {
+                        EvaluateGraph();
+                    }
                 }
             }
             else
@@ -2295,7 +2307,10 @@ void DrawNodeGraph()
             if (ed::AcceptDeletedItem())
             {
                 const int linkId = ToGraphId(deletedLinkId.Get());
-                g_graph.DeleteLink(linkId);
+                if (g_graph.DeleteLink(linkId))
+                {
+                    EvaluateGraph();
+                }
             }
         }
     }
