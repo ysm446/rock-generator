@@ -27,6 +27,7 @@ Windows desktop prototype for a node-based SDF rock generation tool.
 - Interactive viewport orbit, pan, zoom, and reset controls
 - Node-stage preview: selecting graph nodes shows that generation stage in the viewport
 - JSON-driven UI themes in `data/ui_themes`, selectable from `設定 > UIテーマ`
+- Preview compute backend selection for CPU / GPU Preview / Auto; GPU preview uses D3D12 compute for the preview SDF values while final output remains CPU-based.
 
 OpenVDB, real SDF evaluation, mesh extraction, and export nodes are intentionally left for later phases.
 

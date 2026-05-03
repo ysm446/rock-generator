@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <format>
+#include <utility>
 
 namespace rock
 {
@@ -174,13 +175,42 @@ void NodeGraph::MarkDirty(std::string_view reason)
 
 void NodeGraph::Evaluate()
 {
+    evaluation_.requestedPreviewBackend = settings_.previewBackend;
+    evaluation_.effectivePreviewBackend = ComputeBackend::Cpu;
+    evaluation_.previewBackendFallback = settings_.previewBackend != ComputeBackend::Cpu;
     evaluation_.previewSdf = BuildDenseSdfPreview(settings_, 48, evaluation_.previewStage);
     evaluation_.finalSdf = BuildDenseSdfPreview(settings_, 48, PreviewStage::Output);
     ++evaluation_.version;
     evaluation_.dirty = false;
     evaluation_.status = std::format(
-        "{} preview -> {} -> noise {:.2f}/{:.2f}/{} -> crack {:.3f}/{:.2f}/{:.2f} -> dense SDF {}^3",
+        "{} preview [{}{}] -> {} -> noise {:.2f}/{:.2f}/{} -> crack {:.3f}/{:.2f}/{:.2f} -> dense SDF {}^3",
         ToString(evaluation_.previewStage),
+        ToString(evaluation_.effectivePreviewBackend),
+        evaluation_.previewBackendFallback ? " fallback" : "",
+        ToString(settings_.primitive.kind),
+        settings_.noise.amplitude,
+        settings_.noise.frequency,
+        settings_.noise.octaves,
+        settings_.crack.width,
+        settings_.crack.depth,
+        settings_.crack.roughness,
+        evaluation_.previewSdf.resolution);
+}
+
+void NodeGraph::EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend requestedBackend, ComputeBackend effectiveBackend, bool fallback)
+{
+    evaluation_.requestedPreviewBackend = requestedBackend;
+    evaluation_.effectivePreviewBackend = effectiveBackend;
+    evaluation_.previewBackendFallback = fallback;
+    evaluation_.previewSdf = std::move(previewSdf);
+    evaluation_.finalSdf = BuildDenseSdfPreview(settings_, 48, PreviewStage::Output);
+    ++evaluation_.version;
+    evaluation_.dirty = false;
+    evaluation_.status = std::format(
+        "{} preview [{}{}] -> {} -> noise {:.2f}/{:.2f}/{} -> crack {:.3f}/{:.2f}/{:.2f} -> dense SDF {}^3",
+        ToString(evaluation_.previewStage),
+        ToString(evaluation_.effectivePreviewBackend),
+        evaluation_.previewBackendFallback ? " fallback" : "",
         ToString(settings_.primitive.kind),
         settings_.noise.amplitude,
         settings_.noise.frequency,
@@ -294,6 +324,21 @@ std::string_view ToString(ValueType type)
         return "SDFGrid";
     case ValueType::Mesh:
         return "Mesh";
+    default:
+        return "Unknown";
+    }
+}
+
+std::string_view ToString(ComputeBackend backend)
+{
+    switch (backend)
+    {
+    case ComputeBackend::Cpu:
+        return "CPU";
+    case ComputeBackend::GpuPreview:
+        return "GPU Preview";
+    case ComputeBackend::Auto:
+        return "Auto";
     default:
         return "Unknown";
     }

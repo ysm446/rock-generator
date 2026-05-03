@@ -46,6 +46,13 @@ enum class PreviewStage
     Output,
 };
 
+enum class ComputeBackend
+{
+    Cpu,
+    GpuPreview,
+    Auto,
+};
+
 struct Pin
 {
     GraphId id = 0;
@@ -95,6 +102,7 @@ struct GraphSettings
     PrimitiveSettings primitive;
     NoiseSettings noise;
     CrackSettings crack;
+    ComputeBackend previewBackend = ComputeBackend::Cpu;
 };
 
 struct SurfacePoint
@@ -151,6 +159,9 @@ struct EvaluationSummary
     bool dirty = true;
     std::string status = "Graph has not been evaluated";
     PreviewStage previewStage = PreviewStage::Output;
+    ComputeBackend requestedPreviewBackend = ComputeBackend::Cpu;
+    ComputeBackend effectivePreviewBackend = ComputeBackend::Cpu;
+    bool previewBackendFallback = false;
     SdfPreviewStats previewSdf;
     SdfPreviewStats finalSdf;
 };
@@ -179,6 +190,7 @@ public:
     PreviewStage Preview() const;
     void MarkDirty(std::string_view reason);
     void Evaluate();
+    void EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend requestedBackend, ComputeBackend effectiveBackend, bool fallback);
 
 private:
     GraphId AddNode(NodeKind kind, std::string title);
@@ -198,6 +210,7 @@ std::string_view ToString(PrimitiveKind kind);
 std::string_view ToString(NodeKind kind);
 std::string_view ToString(PreviewStage stage);
 std::string_view ToString(ValueType type);
+std::string_view ToString(ComputeBackend backend);
 PreviewStage PreviewStageFor(NodeKind kind);
 
 } // namespace rock

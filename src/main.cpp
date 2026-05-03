@@ -5,12 +5,15 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -21,6 +24,7 @@
 
 #include "node_graph.h"
 #include "obj_exporter.h"
+#include "sdf_preview.h"
 #include "ui/UiTheme.h"
 #include "Version.h"
 
@@ -57,6 +61,8 @@ UINT64 g_fenceLastSignaledValue = 0;
 UINT g_frameIndex = 0;
 UINT g_rtvDescriptorSize = 0;
 UINT g_srvDescriptorSize = 0;
+ComPtr<ID3D12RootSignature> g_sdfComputeRootSignature;
+ComPtr<ID3D12PipelineState> g_sdfComputePipelineState;
 
 std::array<FrameContext, kFrameCount> g_frameContexts;
 std::array<ComPtr<ID3D12Resource>, kFrameCount> g_renderTargets;
@@ -116,6 +122,22 @@ struct ProjectedPoint
     float depth = 0.0f;
 };
 
+struct SdfComputeConstants
+{
+    UINT resolution = 48;
+    UINT primitiveKind = 0;
+    UINT previewStage = 0;
+    UINT noiseOctaves = 4;
+    float noiseAmplitude = 0.0f;
+    float noiseFrequency = 1.0f;
+    float crackWidth = 0.0f;
+    float crackDepth = 0.0f;
+    float crackRoughness = 0.0f;
+    float padding0 = 0.0f;
+    float padding1 = 0.0f;
+    float padding2 = 0.0f;
+};
+
 std::wstring MakeWindowTitle()
 {
     std::wstring title = L"Rock Generator ";
@@ -132,6 +154,46 @@ void ThrowIfFailed(HRESULT hr, const char* message)
     {
         throw std::runtime_error(message);
     }
+}
+
+D3D12_HEAP_PROPERTIES HeapProperties(D3D12_HEAP_TYPE type)
+{
+    D3D12_HEAP_PROPERTIES properties{};
+    properties.Type = type;
+    properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    properties.CreationNodeMask = 1;
+    properties.VisibleNodeMask = 1;
+    return properties;
+}
+
+D3D12_RESOURCE_DESC BufferResourceDesc(UINT64 byteSize, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE)
+{
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Alignment = 0;
+    desc.Width = byteSize;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = flags;
+    return desc;
+}
+
+std::wstring ModuleDirectory()
+{
+    wchar_t path[MAX_PATH]{};
+    const DWORD size = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (size == 0)
+    {
+        return L".";
+    }
+    std::filesystem::path modulePath(path);
+    return modulePath.parent_path().wstring();
 }
 
 void AllocateSrvDescriptor(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE* outCpuHandle, D3D12_GPU_DESCRIPTOR_HANDLE* outGpuHandle)
@@ -321,11 +383,208 @@ void CleanupD3D()
 {
     WaitForLastSubmittedFrame();
     CleanupRenderTarget();
+    g_sdfComputePipelineState.Reset();
+    g_sdfComputeRootSignature.Reset();
     if (g_fenceEvent)
     {
         CloseHandle(g_fenceEvent);
         g_fenceEvent = nullptr;
     }
+}
+
+std::filesystem::path SdfPreviewShaderPath()
+{
+    const std::filesystem::path cwdPath = std::filesystem::path("shaders") / "sdf_preview_cs.hlsl";
+    if (std::filesystem::exists(cwdPath))
+    {
+        return cwdPath;
+    }
+
+    const std::filesystem::path modulePath = std::filesystem::path(ModuleDirectory()) / "shaders" / "sdf_preview_cs.hlsl";
+    if (std::filesystem::exists(modulePath))
+    {
+        return modulePath;
+    }
+
+    return cwdPath;
+}
+
+bool EnsureSdfComputePipeline(std::string* error)
+{
+    if (g_sdfComputeRootSignature && g_sdfComputePipelineState)
+    {
+        return true;
+    }
+
+    if (!g_device)
+    {
+        if (error) *error = "D3D12 device is not initialized";
+        return false;
+    }
+
+    D3D12_ROOT_PARAMETER rootParameters[2]{};
+    rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParameters[0].Constants.ShaderRegister = 0;
+    rootParameters[0].Constants.RegisterSpace = 0;
+    rootParameters[0].Constants.Num32BitValues = sizeof(SdfComputeConstants) / sizeof(UINT);
+    rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rootParameters[1].Descriptor.ShaderRegister = 0;
+    rootParameters[1].Descriptor.RegisterSpace = 0;
+    rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+    rootDesc.NumParameters = 2;
+    rootDesc.pParameters = rootParameters;
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> signatureBlob;
+    ComPtr<ID3DBlob> errorBlob;
+    HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signatureBlob, &errorBlob);
+    if (FAILED(hr))
+    {
+        if (error)
+        {
+            *error = errorBlob ? static_cast<const char*>(errorBlob->GetBufferPointer()) : "D3D12SerializeRootSignature failed";
+        }
+        return false;
+    }
+
+    hr = g_device->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(), IID_PPV_ARGS(&g_sdfComputeRootSignature));
+    if (FAILED(hr))
+    {
+        if (error) *error = "CreateRootSignature failed";
+        return false;
+    }
+
+    const std::filesystem::path shaderPath = SdfPreviewShaderPath();
+    ComPtr<ID3DBlob> shaderBlob;
+    errorBlob.Reset();
+    UINT compileFlags = D3DCOMPILE_ENABLE_STRICTNESS;
+#if defined(_DEBUG)
+    compileFlags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+    hr = D3DCompileFromFile(shaderPath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0", compileFlags, 0, &shaderBlob, &errorBlob);
+    if (FAILED(hr))
+    {
+        if (error)
+        {
+            *error = errorBlob ? static_cast<const char*>(errorBlob->GetBufferPointer()) : "D3DCompileFromFile failed";
+        }
+        return false;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = g_sdfComputeRootSignature.Get();
+    psoDesc.CS.pShaderBytecode = shaderBlob->GetBufferPointer();
+    psoDesc.CS.BytecodeLength = shaderBlob->GetBufferSize();
+    hr = g_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&g_sdfComputePipelineState));
+    if (FAILED(hr))
+    {
+        if (error) *error = "CreateComputePipelineState failed";
+        return false;
+    }
+
+    return true;
+}
+
+bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, rock::PreviewStage stage, int resolution, rock::SdfPreviewStats& outStats, std::string* error)
+{
+    if (!EnsureSdfComputePipeline(error))
+    {
+        return false;
+    }
+
+    try
+    {
+        const UINT clampedResolution = static_cast<UINT>(std::clamp(resolution, 8, 128));
+        const UINT64 valueCount = static_cast<UINT64>(clampedResolution) * clampedResolution * clampedResolution;
+        const UINT64 bufferSize = valueCount * sizeof(float);
+
+        ComPtr<ID3D12Resource> outputBuffer;
+        ComPtr<ID3D12Resource> readbackBuffer;
+        const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+        const D3D12_HEAP_PROPERTIES readbackHeap = HeapProperties(D3D12_HEAP_TYPE_READBACK);
+        const D3D12_RESOURCE_DESC outputDesc = BufferResourceDesc(bufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        const D3D12_RESOURCE_DESC readbackDesc = BufferResourceDesc(bufferSize);
+        ThrowIfFailed(g_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &outputDesc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&outputBuffer)), "Create GPU SDF output failed");
+        ThrowIfFailed(g_device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE, &readbackDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readbackBuffer)), "Create GPU SDF readback failed");
+
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> commandList;
+        ThrowIfFailed(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "Create compute allocator failed");
+        ThrowIfFailed(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commandList)), "Create compute command list failed");
+
+        SdfComputeConstants constants{};
+        constants.resolution = clampedResolution;
+        constants.primitiveKind = static_cast<UINT>(settings.primitive.kind);
+        constants.previewStage = static_cast<UINT>(stage);
+        constants.noiseOctaves = static_cast<UINT>(std::clamp(settings.noise.octaves, 1, 8));
+        constants.noiseAmplitude = settings.noise.amplitude;
+        constants.noiseFrequency = settings.noise.frequency;
+        constants.crackWidth = settings.crack.width;
+        constants.crackDepth = settings.crack.depth;
+        constants.crackRoughness = settings.crack.roughness;
+
+        commandList->SetComputeRootSignature(g_sdfComputeRootSignature.Get());
+        commandList->SetPipelineState(g_sdfComputePipelineState.Get());
+        commandList->SetComputeRoot32BitConstants(0, sizeof(SdfComputeConstants) / sizeof(UINT), &constants, 0);
+        commandList->SetComputeRootUnorderedAccessView(1, outputBuffer->GetGPUVirtualAddress());
+        const UINT groups = (clampedResolution + 7) / 8;
+        commandList->Dispatch(groups, groups, groups);
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = outputBuffer.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        commandList->ResourceBarrier(1, &barrier);
+        commandList->CopyResource(readbackBuffer.Get(), outputBuffer.Get());
+        ThrowIfFailed(commandList->Close(), "Close compute command list failed");
+
+        ID3D12CommandList* commandLists[] = {commandList.Get()};
+        g_commandQueue->ExecuteCommandLists(1, commandLists);
+        const UINT64 fenceValue = ++g_fenceLastSignaledValue;
+        ThrowIfFailed(g_commandQueue->Signal(g_fence.Get(), fenceValue), "Signal compute queue failed");
+        WaitForFenceValue(fenceValue);
+
+        std::vector<float> sdfValues(static_cast<size_t>(valueCount));
+        void* mapped = nullptr;
+        D3D12_RANGE readRange{0, static_cast<SIZE_T>(bufferSize)};
+        ThrowIfFailed(readbackBuffer->Map(0, &readRange, &mapped), "Map GPU SDF readback failed");
+        std::memcpy(sdfValues.data(), mapped, static_cast<size_t>(bufferSize));
+        D3D12_RANGE writeRange{0, 0};
+        readbackBuffer->Unmap(0, &writeRange);
+
+        outStats = rock::BuildDenseSdfPreviewFromValues(static_cast<int>(clampedResolution), sdfValues);
+        return true;
+    }
+    catch (const std::exception& ex)
+    {
+        if (error) *error = ex.what();
+        return false;
+    }
+}
+
+void EvaluateGraph()
+{
+    const rock::GraphSettings& settings = g_graph.Settings();
+    if (settings.previewBackend == rock::ComputeBackend::Cpu)
+    {
+        g_graph.Evaluate();
+        return;
+    }
+
+    rock::SdfPreviewStats gpuPreview;
+    std::string error;
+    if (TryBuildGpuPreviewSdf(settings, g_graph.Preview(), 48, gpuPreview, &error))
+    {
+        g_graph.EvaluateWithPreview(std::move(gpuPreview), settings.previewBackend, rock::ComputeBackend::GpuPreview, false);
+        return;
+    }
+
+    g_graph.Evaluate();
 }
 
 void ResetViewport()
@@ -772,7 +1031,7 @@ void EvaluateWhenParameterEditEnds()
 {
     if (ImGui::IsItemDeactivatedAfterEdit())
     {
-        g_graph.Evaluate();
+        EvaluateGraph();
     }
 }
 
@@ -914,7 +1173,7 @@ void DrawNodeGraph()
         {
             if (g_graph.SetPreviewStage(rock::PreviewStageFor(selectedNode->kind)))
             {
-                g_graph.Evaluate();
+                EvaluateGraph();
             }
         }
     }
@@ -1051,7 +1310,7 @@ void DrawPropertiesPanel()
         {
             settings.primitive.kind = static_cast<rock::PrimitiveKind>(primitive);
             g_graph.MarkDirty("Primitive changed");
-            g_graph.Evaluate();
+            EvaluateGraph();
         }
 
         ImGui::EndTable();
@@ -1065,15 +1324,15 @@ void DrawPropertiesPanel()
 
         if (DrawPropertyFloatRow("Amplitude", "NoiseAmplitude", &settings.noise.amplitude, 0.0f, 2.0f, "Noise amplitude changed"))
         {
-            g_graph.Evaluate();
+            EvaluateGraph();
         }
         if (DrawPropertyFloatRow("Frequency", "NoiseFrequency", &settings.noise.frequency, 0.1f, 12.0f, "Noise frequency changed"))
         {
-            g_graph.Evaluate();
+            EvaluateGraph();
         }
         if (DrawPropertyIntRow("Octaves", "NoiseOctaves", &settings.noise.octaves, 1, 8, "Noise octaves changed"))
         {
-            g_graph.Evaluate();
+            EvaluateGraph();
         }
 
         ImGui::EndTable();
@@ -1087,15 +1346,15 @@ void DrawPropertiesPanel()
 
         if (DrawPropertyFloatRow("Width", "CrackWidth", &settings.crack.width, 0.0f, 0.2f, "Crack width changed"))
         {
-            g_graph.Evaluate();
+            EvaluateGraph();
         }
         if (DrawPropertyFloatRow("Depth", "CrackDepth", &settings.crack.depth, 0.0f, 1.0f, "Crack depth changed"))
         {
-            g_graph.Evaluate();
+            EvaluateGraph();
         }
         if (DrawPropertyFloatRow("Roughness", "CrackRoughness", &settings.crack.roughness, 0.0f, 1.0f, "Crack roughness changed"))
         {
-            g_graph.Evaluate();
+            EvaluateGraph();
         }
 
         ImGui::EndTable();
@@ -1108,14 +1367,14 @@ void DrawPropertiesPanel()
         ImGui::Spacing();
         if (ImGui::Button("Build Mesh"))
         {
-            g_graph.Evaluate();
+            EvaluateGraph();
         }
         ImGui::SameLine();
         if (ImGui::Button("Export OBJ"))
         {
             if (g_graph.Evaluation().dirty)
             {
-                g_graph.Evaluate();
+                EvaluateGraph();
             }
 
             std::string error;
@@ -1160,6 +1419,37 @@ void DrawCameraPanel()
     ImGui::TextDisabled("Grid: 10 x 10 m, 1 m cells");
 }
 
+void DrawComputePanel()
+{
+    rock::GraphSettings& settings = g_graph.Settings();
+    int backend = static_cast<int>(settings.previewBackend);
+    if (ImGui::BeginTable("ComputeRows", 2, ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+        if (DrawPropertyComboRow("Preview", "PreviewBackend", &backend, "CPU\0GPU Preview\0Auto\0"))
+        {
+            settings.previewBackend = static_cast<rock::ComputeBackend>(backend);
+            g_graph.MarkDirty("Preview compute backend changed");
+            EvaluateGraph();
+        }
+
+        ImGui::EndTable();
+    }
+
+    const rock::EvaluationSummary& evaluation = g_graph.Evaluation();
+    ImGui::Spacing();
+    ImGui::Text("Requested: %s", rock::ToString(evaluation.requestedPreviewBackend).data());
+    ImGui::Text("Effective: %s", rock::ToString(evaluation.effectivePreviewBackend).data());
+    if (evaluation.previewBackendFallback)
+    {
+        ImGui::TextColored(ImVec4(0.90f, 0.64f, 0.30f, 1.0f), "GPU preview is not wired yet; using CPU.");
+    }
+    ImGui::SeparatorText("Policy");
+    ImGui::TextWrapped("GPU is reserved for viewport preview. Final output and OBJ export currently use the CPU path.");
+}
+
 void DrawStatsPanel()
 {
     const rock::EvaluationSummary& evaluation = g_graph.Evaluation();
@@ -1200,14 +1490,14 @@ void DrawAssetExportPanel()
     ImGui::TextUnformatted("Export");
     if (ImGui::Button("Build Mesh"))
     {
-        g_graph.Evaluate();
+        EvaluateGraph();
     }
     ImGui::SameLine();
     if (ImGui::Button("Export OBJ"))
     {
         if (g_graph.Evaluation().dirty)
         {
-            g_graph.Evaluate();
+            EvaluateGraph();
         }
 
         std::string error;
@@ -1281,6 +1571,23 @@ void DrawUi()
         }
         if (ImGui::BeginMenu("設定"))
         {
+            if (ImGui::BeginMenu("計算バックエンド"))
+            {
+                rock::GraphSettings& settings = g_graph.Settings();
+                const auto drawBackendItem = [&](const char* label, rock::ComputeBackend backend) {
+                    const bool selected = settings.previewBackend == backend;
+                    if (ImGui::MenuItem(label, nullptr, selected))
+                    {
+                        settings.previewBackend = backend;
+                        g_graph.MarkDirty("Preview compute backend changed");
+                        EvaluateGraph();
+                    }
+                };
+                drawBackendItem("CPU", rock::ComputeBackend::Cpu);
+                drawBackendItem("GPU Preview", rock::ComputeBackend::GpuPreview);
+                drawBackendItem("Auto", rock::ComputeBackend::Auto);
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("UIテーマ"))
             {
                 for (const rock::UiThemeInfo& themeInfo : g_themeManager.ThemeInfos())
@@ -1302,7 +1609,7 @@ void DrawUi()
         {
             if (ImGui::MenuItem("グラフを評価"))
             {
-                g_graph.Evaluate();
+                EvaluateGraph();
             }
             ImGui::EndMenu();
         }
@@ -1312,7 +1619,7 @@ void DrawUi()
             {
                 if (g_graph.Evaluation().dirty)
                 {
-                    g_graph.Evaluate();
+                    EvaluateGraph();
                 }
 
                 std::string error;
@@ -1394,6 +1701,11 @@ void DrawUi()
         if (ImGui::BeginTabItem("カメラ"))
         {
             DrawCameraPanel();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("計算"))
+        {
+            DrawComputePanel();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
