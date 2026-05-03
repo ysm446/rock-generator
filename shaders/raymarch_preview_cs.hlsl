@@ -14,6 +14,7 @@ cbuffer Settings : register(b0)
     float crackRoughness;
     float isoValue;
     float preCameraPadding;
+    float2 cameraPadding;
     float4 cameraPosition;
     float4 cameraRight;
     float4 cameraUp;

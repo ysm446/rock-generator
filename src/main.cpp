@@ -76,12 +76,14 @@ std::array<bool, kSrvDescriptorCount> g_srvDescriptorUsed{};
 ed::EditorContext* g_nodeEditor = nullptr;
 bool g_nodePositionsInitialized = false;
 bool g_nodeGraphNavigatedToContent = false;
+bool g_layoutSplitterActive = false;
 rock::NodeGraph g_graph = rock::NodeGraph::CreateDefaultRockGraph();
 std::string g_exportStatus = "No export yet";
 std::string g_projectStatus = "No project file";
 std::filesystem::path g_projectPath;
 std::vector<std::filesystem::path> g_recentProjectPaths;
 std::vector<std::pair<rock::GraphId, ImVec2>> g_pendingNodePositions;
+std::vector<rock::GraphId> g_pendingSelectedNodeIds;
 rock::UiThemeManager g_themeManager;
 rock::GraphId g_selectedNodeId = 0;
 
@@ -96,6 +98,8 @@ struct UiState
     float crackRoughness = 0.65f;
     bool meshPreview = true;
     bool sdfPreview = false;
+    float rightPaneWidth = 0.0f;
+    float nodePaneHeight = 0.0f;
 };
 
 UiState g_ui;
@@ -208,6 +212,7 @@ struct RaymarchComputeConstants
     float crackRoughness = 0.0f;
     float isoValue = 0.0f;
     float preCameraPadding = 0.0f;
+    float cameraPadding[2]{};
     float cameraPosition[4]{};
     float cameraRight[4]{};
     float cameraUp[4]{};
@@ -641,6 +646,11 @@ bool SaveAppSettings(std::string* error = nullptr)
             {"mesh", g_ui.meshPreview},
             {"raymarch", g_ui.sdfPreview},
             {"meshDisplayMode", static_cast<int>(settings.outputMesh.displayMode)},
+            {"centerSlice", settings.outputMesh.showSlice},
+        };
+        root["layout"] = {
+            {"rightPaneWidth", g_ui.rightPaneWidth},
+            {"nodePaneHeight", g_ui.nodePaneHeight},
         };
         root["recentProjects"] = nlohmann::json::array();
         for (const std::filesystem::path& recentPath : g_recentProjectPaths)
@@ -725,6 +735,11 @@ bool LoadAppSettings(std::string* error = nullptr)
         g_ui.meshPreview = visibilityJson.value("mesh", g_ui.meshPreview);
         g_ui.sdfPreview = visibilityJson.value("raymarch", g_ui.sdfPreview);
         settings.outputMesh.displayMode = static_cast<rock::MeshDisplayMode>(std::clamp(visibilityJson.value("meshDisplayMode", static_cast<int>(settings.outputMesh.displayMode)), 0, 1));
+        settings.outputMesh.showSlice = visibilityJson.value("centerSlice", settings.outputMesh.showSlice);
+
+        const nlohmann::json layoutJson = root.value("layout", nlohmann::json::object());
+        g_ui.rightPaneWidth = std::max(0.0f, layoutJson.value("rightPaneWidth", g_ui.rightPaneWidth));
+        g_ui.nodePaneHeight = std::max(0.0f, layoutJson.value("nodePaneHeight", g_ui.nodePaneHeight));
 
         g_recentProjectPaths.clear();
         if (root.contains("recentProjects") && root["recentProjects"].is_array())
@@ -766,6 +781,7 @@ void ResetNodeEditorViewToDefault()
     g_nodePositionsInitialized = false;
     g_nodeGraphNavigatedToContent = false;
     g_pendingNodePositions.clear();
+    g_pendingSelectedNodeIds.clear();
     if (g_nodeEditor != nullptr)
     {
         ed::SetCurrentEditor(g_nodeEditor);
@@ -803,6 +819,7 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
         root["appVersion"] = ROCK_GENERATOR_VERSION_STRING;
         root["theme"] = g_themeManager.CurrentThemeId();
         root["selectedNodeId"] = g_selectedNodeId;
+        root["selectedNodeIds"] = nlohmann::json::array();
         root["previewStage"] = static_cast<int>(g_graph.Preview());
 
         root["settings"] = {
@@ -853,6 +870,14 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
         if (g_nodeEditor != nullptr)
         {
             ed::SetCurrentEditor(g_nodeEditor);
+            std::vector<ed::NodeId> selectedNodes(g_graph.Nodes().size());
+            const int selectedCount = ed::GetSelectedNodes(selectedNodes.data(), static_cast<int>(selectedNodes.size()));
+            g_selectedNodeId = selectedCount > 0 ? static_cast<rock::GraphId>(selectedNodes.front().Get()) : 0;
+            root["selectedNodeId"] = g_selectedNodeId;
+            for (int i = 0; i < selectedCount; ++i)
+            {
+                root["selectedNodeIds"].push_back(static_cast<rock::GraphId>(selectedNodes[static_cast<size_t>(i)].Get()));
+            }
             for (const rock::Node& node : g_graph.Nodes())
             {
                 const ImVec2 position = ed::GetNodePosition(ed::NodeId(node.id));
@@ -955,6 +980,26 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         }
         g_graph.ReplaceLinks(std::move(links));
         g_selectedNodeId = root.value("selectedNodeId", 0);
+        g_pendingSelectedNodeIds.clear();
+        if (root.contains("selectedNodeIds") && root["selectedNodeIds"].is_array())
+        {
+            for (const nlohmann::json& nodeIdJson : root["selectedNodeIds"])
+            {
+                if (!nodeIdJson.is_number_integer())
+                {
+                    continue;
+                }
+                const rock::GraphId nodeId = nodeIdJson.get<rock::GraphId>();
+                if (g_graph.FindNode(nodeId) != nullptr)
+                {
+                    g_pendingSelectedNodeIds.push_back(nodeId);
+                }
+            }
+        }
+        else if (g_graph.FindNode(g_selectedNodeId) != nullptr)
+        {
+            g_pendingSelectedNodeIds.push_back(g_selectedNodeId);
+        }
         g_graph.SetPreviewStage(static_cast<rock::PreviewStage>(std::clamp(root.value("previewStage", static_cast<int>(g_graph.Preview())), 0, 3)));
 
         g_pendingNodePositions.clear();
@@ -1279,6 +1324,11 @@ void ResetViewport()
 void UpdateViewportInteraction(const ImVec2& min, const ImVec2& max)
 {
     ImGuiIO& io = ImGui::GetIO();
+    if (g_layoutSplitterActive)
+    {
+        return;
+    }
+
     const bool hovered = ImGui::IsMouseHoveringRect(min, max);
     if (!hovered && !ImGui::IsMouseDragging(ImGuiMouseButton_Left) && !ImGui::IsMouseDragging(ImGuiMouseButton_Right) && !ImGui::IsMouseDragging(ImGuiMouseButton_Middle))
     {
@@ -2091,7 +2141,7 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     drawList->AddText(ImVec2(min.x + 16.0f, min.y + 14.0f), ThemeColor("accentText", ImVec4(0.86f, 0.88f, 0.85f, 1.0f)), title.c_str());
     drawList->AddText(ImVec2(min.x + 16.0f, min.y + 36.0f), ThemeColor("mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)), "Right-handed, Y-up, 10 x 10 m grid");
     DrawViewportAxisGizmo(drawList, min, max);
-    if (g_ui.meshPreview && g_graph.Settings().outputMesh.showSlice)
+    if (g_graph.Settings().outputMesh.showSlice)
     {
         DrawSdfSliceOverlay(drawList, min, max, g_graph.Evaluation().previewSdf);
     }
@@ -2268,6 +2318,28 @@ void DrawNodeGraph()
         g_nodeGraphNavigatedToContent = true;
     }
 
+    if (!g_pendingSelectedNodeIds.empty())
+    {
+        ed::ClearSelection();
+        bool append = false;
+        g_selectedNodeId = 0;
+        for (const rock::GraphId nodeId : g_pendingSelectedNodeIds)
+        {
+            if (g_graph.FindNode(nodeId) == nullptr)
+            {
+                continue;
+            }
+
+            ed::SelectNode(ed::NodeId(nodeId), append);
+            append = true;
+            if (g_selectedNodeId == 0)
+            {
+                g_selectedNodeId = nodeId;
+            }
+        }
+        g_pendingSelectedNodeIds.clear();
+    }
+
     for (const rock::Link& link : g_graph.Links())
     {
         ed::Link(ed::LinkId(link.id), ed::PinId(link.startPin), ed::PinId(link.endPin), ImVec4(0.52f, 0.70f, 0.59f, 1.0f), 2.5f);
@@ -2346,7 +2418,8 @@ bool DrawPropertyComboRow(const char* label, const char* id, int* value, const c
     ImGui::TextUnformatted(label);
     ImGui::TableSetColumnIndex(1);
     ImGui::PushID(id);
-    ImGui::SetNextItemWidth(-1.0f);
+    const float comboWidth = std::min(220.0f, ImGui::GetContentRegionAvail().x);
+    ImGui::SetNextItemWidth(comboWidth);
     const bool changed = ImGui::Combo("##value", value, items);
     ImGui::PopID();
     return changed;
@@ -2363,7 +2436,11 @@ bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float
 
     ImGui::PushID(id);
     const float inputWidth = 76.0f;
-    const float sliderWidth = std::max(80.0f, ImGui::GetContentRegionAvail().x - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x);
+    const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float sliderWidth = std::clamp(
+        availableWidth - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x,
+        80.0f,
+        180.0f);
     ImGui::SetNextItemWidth(sliderWidth);
     if (ImGui::SliderFloat("##slider", value, minValue, maxValue, "%.3f"))
     {
@@ -2394,7 +2471,11 @@ bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minVa
 
     ImGui::PushID(id);
     const float inputWidth = 58.0f;
-    const float sliderWidth = std::max(80.0f, ImGui::GetContentRegionAvail().x - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x);
+    const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float sliderWidth = std::clamp(
+        availableWidth - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x,
+        80.0f,
+        180.0f);
     ImGui::SetNextItemWidth(sliderWidth);
     if (ImGui::SliderInt("##slider", value, minValue, maxValue))
     {
@@ -2442,7 +2523,11 @@ void DrawCameraFloatRow(const char* label, const char* id, float* value, float m
 
     ImGui::PushID(id);
     const float inputWidth = 76.0f;
-    const float sliderWidth = std::max(80.0f, ImGui::GetContentRegionAvail().x - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x);
+    const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float sliderWidth = std::clamp(
+        availableWidth - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x,
+        80.0f,
+        180.0f);
     ImGui::SetNextItemWidth(sliderWidth);
     ImGui::SliderFloat("##slider", value, minValue, maxValue, format);
     ImGui::SameLine();
@@ -2734,11 +2819,95 @@ void DrawAssetExportPanel()
     ImGui::Columns(1);
 }
 
+bool DrawVerticalSplitter(const char* id, float* leftWidth, float totalWidth, float minLeftWidth, float minRightWidth, float height)
+{
+    constexpr float splitterWidth = 7.0f;
+    const float maxLeftWidth = std::max(minLeftWidth, totalWidth - minRightWidth - splitterWidth);
+    *leftWidth = std::clamp(*leftWidth, minLeftWidth, maxLeftWidth);
+
+    ImGui::SameLine();
+    ImGui::PushID(id);
+    ImGui::InvisibleButton("##splitter", ImVec2(splitterWidth, height));
+    const bool active = ImGui::IsItemActive();
+    const bool hovered = ImGui::IsItemHovered();
+    if (active)
+    {
+        g_layoutSplitterActive = true;
+    }
+    if (active)
+    {
+        *leftWidth = std::clamp(*leftWidth + ImGui::GetIO().MouseDelta.x, minLeftWidth, maxLeftWidth);
+    }
+    if (hovered || active)
+    {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    }
+
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    const ImVec4 color = active
+        ? g_themeManager.AppColor("accent", ImVec4(0.52f, 0.70f, 0.59f, 1.0f))
+        : g_themeManager.AppColor("border", ImVec4(0.22f, 0.24f, 0.23f, 1.0f));
+    const float lineX = std::floor((min.x + max.x) * 0.5f);
+    ImGui::GetWindowDrawList()->AddLine(
+        ImVec2(lineX, min.y),
+        ImVec2(lineX, max.y),
+        ColorToU32(color),
+        active ? 2.0f : 1.0f);
+    const bool released = ImGui::IsItemDeactivated();
+    ImGui::PopID();
+    ImGui::SameLine();
+    return released;
+}
+
+bool DrawHorizontalSplitter(const char* id, float* topHeight, float totalHeight, float minTopHeight, float minBottomHeight)
+{
+    constexpr float splitterHeight = 7.0f;
+    const float maxTopHeight = std::max(minTopHeight, totalHeight - minBottomHeight - splitterHeight);
+    *topHeight = std::clamp(*topHeight, minTopHeight, maxTopHeight);
+
+    ImGui::PushID(id);
+    ImGui::InvisibleButton("##splitter", ImVec2(-1.0f, splitterHeight));
+    const bool active = ImGui::IsItemActive();
+    const bool hovered = ImGui::IsItemHovered();
+    if (active)
+    {
+        g_layoutSplitterActive = true;
+    }
+    if (active)
+    {
+        *topHeight = std::clamp(*topHeight + ImGui::GetIO().MouseDelta.y, minTopHeight, maxTopHeight);
+    }
+    if (hovered || active)
+    {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    }
+
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    const ImVec4 color = active
+        ? g_themeManager.AppColor("accent", ImVec4(0.52f, 0.70f, 0.59f, 1.0f))
+        : g_themeManager.AppColor("border", ImVec4(0.22f, 0.24f, 0.23f, 1.0f));
+    const float lineY = std::floor((min.y + max.y) * 0.5f);
+    ImGui::GetWindowDrawList()->AddLine(
+        ImVec2(min.x, lineY),
+        ImVec2(max.x, lineY),
+        ColorToU32(color),
+        active ? 2.0f : 1.0f);
+    const bool released = ImGui::IsItemDeactivated();
+    ImGui::PopID();
+    return released;
+}
+
 void DrawUi()
 {
     static const auto start = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const float timeSeconds = std::chrono::duration<float>(now - start).count();
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+    {
+        g_layoutSplitterActive = false;
+    }
     constexpr ImGuiWindowFlags shellFlags =
         ImGuiWindowFlags_NoDecoration |
         ImGuiWindowFlags_NoMove |
@@ -2883,6 +3052,10 @@ void DrawUi()
             {
                 SaveAppSettingsSilently();
             }
+            if (ImGui::MenuItem("SDF Center Slice", nullptr, &settings.outputMesh.showSlice))
+            {
+                SaveAppSettingsSilently();
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("設定"))
@@ -2961,15 +3134,22 @@ void DrawUi()
     const ImVec2 content = ImGui::GetContentRegionAvail();
     const float statusBarHeight = ImGui::GetTextLineHeight() + 16.0f;
     const float workHeight = std::max(260.0f, content.y - statusBarHeight);
-    const float rightWidth = std::clamp(content.x * 0.42f, 480.0f, std::min(820.0f, std::max(360.0f, content.x - 360.0f)));
-    const float previewWidth = std::max(360.0f, content.x - rightWidth);
+    constexpr float mainSplitterWidth = 7.0f;
+    constexpr float paneMinWidth = 320.0f;
+    if (g_ui.rightPaneWidth <= 0.0f)
+    {
+        g_ui.rightPaneWidth = std::clamp(content.x * 0.42f, 480.0f, std::min(820.0f, std::max(paneMinWidth, content.x - paneMinWidth)));
+    }
+    const float maxRightWidth = std::max(paneMinWidth, content.x - paneMinWidth - mainSplitterWidth);
+    g_ui.rightPaneWidth = std::clamp(g_ui.rightPaneWidth, paneMinWidth, maxRightWidth);
+    float previewWidth = std::max(paneMinWidth, content.x - g_ui.rightPaneWidth - mainSplitterWidth);
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::BeginChild("Preview Viewport", ImVec2(previewWidth, workHeight), true, fixedPaneFlags);
+    ImGui::BeginChild("Preview Viewport", ImVec2(previewWidth, workHeight), false, fixedPaneFlags);
     const ImVec2 min = ImGui::GetCursorScreenPos();
     const ImVec2 max(min.x + ImGui::GetContentRegionAvail().x, min.y + ImGui::GetContentRegionAvail().y);
     DrawViewportCube(min, max, timeSeconds);
@@ -2977,21 +3157,39 @@ void DrawUi()
     ImGui::EndChild();
     ImGui::PopStyleVar();
 
-    ImGui::SameLine();
+    if (DrawVerticalSplitter("MainLayoutSplitter", &previewWidth, content.x, paneMinWidth, paneMinWidth, workHeight))
+    {
+        SaveAppSettingsSilently();
+    }
+    g_ui.rightPaneWidth = std::max(paneMinWidth, content.x - previewWidth - mainSplitterWidth);
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
-    ImGui::BeginChild("Right Work Column", ImVec2(rightWidth, workHeight), false, fixedPaneFlags);
+    ImGui::BeginChild("Right Work Column", ImVec2(g_ui.rightPaneWidth, workHeight), false, fixedPaneFlags);
     const float rightColumnHeight = ImGui::GetContentRegionAvail().y;
-    const float nodeHeight = std::clamp(rightColumnHeight * 0.56f, 220.0f, std::max(220.0f, rightColumnHeight - 190.0f));
+    constexpr float inspectorSplitterHeight = 7.0f;
+    if (g_ui.nodePaneHeight <= 0.0f)
+    {
+        g_ui.nodePaneHeight = std::clamp(rightColumnHeight * 0.56f, 220.0f, std::max(220.0f, rightColumnHeight - 190.0f));
+    }
+    g_ui.nodePaneHeight = std::clamp(g_ui.nodePaneHeight, 160.0f, std::max(160.0f, rightColumnHeight - 160.0f - inspectorSplitterHeight));
 
-    ImGui::BeginChild("Node Network", ImVec2(0.0f, nodeHeight), true, fixedPaneFlags);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    ImGui::BeginChild("Node Network", ImVec2(0.0f, g_ui.nodePaneHeight), false, fixedPaneFlags);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
     ImGui::TextUnformatted("ノードネットワーク");
     ImGui::Separator();
     DrawNodeGraph();
+    ImGui::PopStyleVar();
     ImGui::EndChild();
 
-    ImGui::BeginChild("Inspector", ImVec2(0.0f, 0.0f), true);
+    if (DrawHorizontalSplitter("InspectorLayoutSplitter", &g_ui.nodePaneHeight, rightColumnHeight, 160.0f, 160.0f))
+    {
+        SaveAppSettingsSilently();
+    }
+    ImGui::PopStyleVar();
+
+    ImGui::BeginChild("Inspector", ImVec2(0.0f, 0.0f), false);
     if (ImGui::BeginTabBar("InspectorTabs"))
     {
         if (ImGui::BeginTabItem("プロパティ"))

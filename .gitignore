@@ -3,7 +3,7 @@ out/
 .vs/
 .vscode/
 CMakeUserPresets.json
-data/app_settings.json
+data/
 *.user
 *.suo
 *.obj
