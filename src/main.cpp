@@ -81,6 +81,7 @@ std::string g_exportStatus = "No export yet";
 std::string g_projectStatus = "No project file";
 std::filesystem::path g_projectPath;
 std::vector<std::filesystem::path> g_recentProjectPaths;
+std::vector<std::pair<rock::GraphId, ImVec2>> g_pendingNodePositions;
 rock::UiThemeManager g_themeManager;
 rock::GraphId g_selectedNodeId = 0;
 
@@ -760,6 +761,7 @@ void ResetNodeEditorViewToDefault()
     g_selectedNodeId = 0;
     g_nodePositionsInitialized = false;
     g_nodeGraphNavigatedToContent = false;
+    g_pendingNodePositions.clear();
     if (g_nodeEditor != nullptr)
     {
         ed::SetCurrentEditor(g_nodeEditor);
@@ -951,9 +953,9 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         g_selectedNodeId = root.value("selectedNodeId", 0);
         g_graph.SetPreviewStage(static_cast<rock::PreviewStage>(std::clamp(root.value("previewStage", static_cast<int>(g_graph.Preview())), 0, 3)));
 
-        if (g_nodeEditor != nullptr && root.contains("nodePositions") && root["nodePositions"].is_object())
+        g_pendingNodePositions.clear();
+        if (root.contains("nodePositions") && root["nodePositions"].is_object())
         {
-            ed::SetCurrentEditor(g_nodeEditor);
             for (const rock::Node& node : g_graph.Nodes())
             {
                 const std::string key = std::to_string(node.id);
@@ -965,12 +967,12 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
                 const nlohmann::json& positionJson = root["nodePositions"][key];
                 if (positionJson.is_array() && positionJson.size() == 2)
                 {
-                    ed::SetNodePosition(ed::NodeId(node.id), ImVec2(positionJson[0].get<float>(), positionJson[1].get<float>()));
+                    g_pendingNodePositions.push_back({node.id, ImVec2(positionJson[0].get<float>(), positionJson[1].get<float>())});
                 }
             }
-            ed::SetCurrentEditor(nullptr);
-            g_nodePositionsInitialized = true;
         }
+        g_nodePositionsInitialized = false;
+        g_nodeGraphNavigatedToContent = false;
 
         const std::string themeId = root.value("theme", std::string());
         if (!themeId.empty())
@@ -2175,13 +2177,25 @@ void DrawPinLabel(const rock::Pin& pin)
     ImGui::TextColored(color, "%s", pin.label.c_str());
 }
 
+void DrawNodeDivider(float width)
+{
+    const ImVec2 cursor = ImGui::GetCursorScreenPos();
+    const float y = cursor.y + 3.0f;
+    ImGui::GetWindowDrawList()->AddLine(
+        ImVec2(cursor.x, y),
+        ImVec2(cursor.x + width, y),
+        ThemeColor("border", ImVec4(0.28f, 0.31f, 0.30f, 1.0f)),
+        1.0f);
+    ImGui::Dummy(ImVec2(width, 8.0f));
+}
+
 void DrawRockNode(const rock::Node& node)
 {
     ed::BeginNode(ed::NodeId(node.id));
     ImGui::PushStyleColor(ImGuiCol_Text, NodeAccentColor(node.kind));
     ImGui::TextUnformatted(node.title.c_str());
     ImGui::PopStyleColor();
-    ImGui::Separator();
+    DrawNodeDivider(150.0f);
 
     if (!node.inputs.empty())
     {
@@ -2210,13 +2224,32 @@ void DrawNodeGraph()
     ed::SetCurrentEditor(g_nodeEditor);
     ed::Begin("Rock Node Graph", ImGui::GetContentRegionAvail());
 
+    const bool hasPendingNodePositions = !g_pendingNodePositions.empty();
     for (const rock::Node& node : g_graph.Nodes())
     {
         DrawRockNode(node);
-        if (!g_nodePositionsInitialized)
+        if (hasPendingNodePositions)
+        {
+            const auto pending = std::ranges::find_if(g_pendingNodePositions, [&](const auto& entry) {
+                return entry.first == node.id;
+            });
+            if (pending != g_pendingNodePositions.end())
+            {
+                ed::SetNodePosition(ed::NodeId(node.id), pending->second);
+            }
+            else
+            {
+                ed::SetNodePosition(ed::NodeId(node.id), InitialNodePosition(node.kind));
+            }
+        }
+        else if (!g_nodePositionsInitialized)
         {
             ed::SetNodePosition(ed::NodeId(node.id), InitialNodePosition(node.kind));
         }
+    }
+    if (hasPendingNodePositions)
+    {
+        g_pendingNodePositions.clear();
     }
     g_nodePositionsInitialized = true;
 
@@ -3117,7 +3150,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         ImGui_ImplDX12_Init(&dx12InitInfo);
 
         ed::Config nodeEditorConfig{};
-        nodeEditorConfig.SettingsFile = "RockGeneratorNodeEditor.json";
+        nodeEditorConfig.SettingsFile = nullptr;
         nodeEditorConfig.NavigateButtonIndex = 2;
         g_nodeEditor = ed::CreateEditor(&nodeEditorConfig);
 
