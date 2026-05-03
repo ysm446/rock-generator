@@ -68,6 +68,13 @@ struct Pin
     std::string label;
 };
 
+struct OutputMeshSettings
+{
+    int resolution = 96;
+    int lod = 0;
+    float isoValue = 0.0f;
+};
+
 struct Node
 {
     GraphId id = 0;
@@ -75,6 +82,7 @@ struct Node
     std::string title;
     std::vector<Pin> inputs;
     std::vector<Pin> outputs;
+    OutputMeshSettings outputMesh;
 };
 
 struct Link
@@ -103,13 +111,6 @@ struct CrackSettings
     float roughness = 0.65f;
 };
 
-struct OutputMeshSettings
-{
-    int resolution = 96;
-    int lod = 0;
-    float isoValue = 0.0f;
-};
-
 struct PreviewSettings
 {
     int resolution = 48;
@@ -126,7 +127,6 @@ struct GraphSettings
     PrimitiveSettings primitive;
     NoiseSettings noise;
     CrackSettings crack;
-    OutputMeshSettings outputMesh;
     PreviewSettings preview;
     ComputeBackend previewBackend = ComputeBackend::Cpu;
 };
@@ -214,12 +214,15 @@ struct SdfPipeline
     bool useNoise = false;
     bool useCrack = false;
     bool applyOutputIso = false;
+    float outputIsoValue = 0.0f;
 };
 
 struct EvaluationSummary
 {
     uint64_t version = 0;
+    uint64_t finalVersion = 0;
     bool dirty = true;
+    bool finalDirty = true;
     std::string status = "Graph has not been evaluated";
     PreviewStage previewStage = PreviewStage::Output;
     ComputeBackend requestedPreviewBackend = ComputeBackend::Cpu;
@@ -241,6 +244,9 @@ public:
     GraphSettings& Settings();
     const GraphSettings& Settings() const;
     const EvaluationSummary& Evaluation() const;
+    OutputMeshSettings* FindOutputMeshSettings(GraphId nodeId);
+    const OutputMeshSettings* FindOutputMeshSettings(GraphId nodeId) const;
+    const OutputMeshSettings& OutputMeshSettingsFor(GraphId nodeId = 0) const;
 
     const Pin* FindPin(GraphId pinId) const;
     const Node* FindNode(GraphId nodeId) const;
@@ -251,6 +257,9 @@ public:
 
     bool CreateLink(GraphId startPin, GraphId endPin);
     bool DeleteLink(GraphId linkId);
+    GraphId CreateNode(NodeKind kind);
+    bool DeleteNode(GraphId nodeId);
+    void ReplaceNodes(std::vector<Node> nodes);
     void ReplaceLinks(std::vector<Link> links);
     bool SetPreviewStage(PreviewStage stage);
     PreviewStage Preview() const;
@@ -258,7 +267,8 @@ public:
     SdfPipeline PreviewPipeline() const;
     SdfPipeline FinalPipeline() const;
     void MarkDirty(std::string_view reason);
-    void Evaluate();
+    void Evaluate(int previewMeshResolution = 0);
+    void EvaluateFinal(GraphId outputNodeId = 0);
     void EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend requestedBackend, ComputeBackend effectiveBackend, bool fallback);
 
 private:
@@ -266,6 +276,7 @@ private:
     GraphId AddPin(GraphId nodeId, PinKind kind, ValueType valueType, std::string label);
     void AddInitialLink(GraphId startPin, GraphId endPin);
     const Node* FindFirstNode(NodeKind kind) const;
+    Node* FindMutableNode(GraphId nodeId);
     const Node* FindNodeByOutputPin(GraphId pinId) const;
     const Node* FindUpstreamNode(const Node& node) const;
     SdfPipeline PipelineTo(NodeKind targetKind) const;

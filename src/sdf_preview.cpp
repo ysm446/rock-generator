@@ -178,7 +178,7 @@ float EvaluatePipelineSdf(Vec3 p, const GraphSettings& settings, const SdfPipeli
 
     if (pipeline.applyOutputIso)
     {
-        sdf -= settings.outputMesh.isoValue;
+        sdf -= pipeline.outputIsoValue;
     }
     return sdf;
 }

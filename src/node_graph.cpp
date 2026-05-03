@@ -216,6 +216,33 @@ const EvaluationSummary& NodeGraph::Evaluation() const
     return evaluation_;
 }
 
+OutputMeshSettings* NodeGraph::FindOutputMeshSettings(GraphId nodeId)
+{
+    Node* node = FindMutableNode(nodeId);
+    return node != nullptr && node->kind == NodeKind::OutputMesh ? &node->outputMesh : nullptr;
+}
+
+const OutputMeshSettings* NodeGraph::FindOutputMeshSettings(GraphId nodeId) const
+{
+    const Node* node = FindNode(nodeId);
+    return node != nullptr && node->kind == NodeKind::OutputMesh ? &node->outputMesh : nullptr;
+}
+
+const OutputMeshSettings& NodeGraph::OutputMeshSettingsFor(GraphId nodeId) const
+{
+    if (const OutputMeshSettings* settings = FindOutputMeshSettings(nodeId))
+    {
+        return *settings;
+    }
+    if (const Node* outputNode = FindFirstNode(NodeKind::OutputMesh))
+    {
+        return outputNode->outputMesh;
+    }
+
+    static constexpr OutputMeshSettings fallback{};
+    return fallback;
+}
+
 const Pin* NodeGraph::FindPin(GraphId pinId) const
 {
     for (const Node& node : nodes_)
@@ -312,6 +339,79 @@ bool NodeGraph::DeleteLink(GraphId linkId)
     return true;
 }
 
+bool NodeGraph::DeleteNode(GraphId nodeId)
+{
+    const Node* node = FindNode(nodeId);
+    if (node == nullptr)
+    {
+        return false;
+    }
+
+    std::vector<GraphId> pinIds;
+    pinIds.reserve(node->inputs.size() + node->outputs.size());
+    for (const Pin& pin : node->inputs)
+    {
+        pinIds.push_back(pin.id);
+    }
+    for (const Pin& pin : node->outputs)
+    {
+        pinIds.push_back(pin.id);
+    }
+
+    std::erase_if(links_, [&](const Link& link) {
+        return std::ranges::find(pinIds, link.startPin) != pinIds.end() ||
+               std::ranges::find(pinIds, link.endPin) != pinIds.end();
+    });
+    std::erase_if(nodes_, [nodeId](const Node& candidate) {
+        return candidate.id == nodeId;
+    });
+    MarkDirty("Node deleted");
+    return true;
+}
+
+GraphId NodeGraph::CreateNode(NodeKind kind)
+{
+    const GraphId nodeId = AddNode(kind, std::string(ToString(kind)));
+    switch (kind)
+    {
+    case NodeKind::PrimitiveSdf:
+        AddPin(nodeId, PinKind::Output, ValueType::SdfGrid, "SDFGrid");
+        break;
+    case NodeKind::NoiseWarp:
+    case NodeKind::CrackField:
+        AddPin(nodeId, PinKind::Input, ValueType::SdfGrid, "SDFGrid");
+        AddPin(nodeId, PinKind::Output, ValueType::SdfGrid, "SDFGrid");
+        break;
+    case NodeKind::OutputMesh:
+        AddPin(nodeId, PinKind::Input, ValueType::SdfGrid, "SDFGrid");
+        break;
+    default:
+        break;
+    }
+    MarkDirty("Node added");
+    return nodeId;
+}
+
+void NodeGraph::ReplaceNodes(std::vector<Node> nodes)
+{
+    nodes_ = std::move(nodes);
+    nextNodeId_ = 1;
+    nextPinId_ = 11;
+    for (const Node& node : nodes_)
+    {
+        nextNodeId_ = std::max(nextNodeId_, node.id + 1);
+        for (const Pin& pin : node.inputs)
+        {
+            nextPinId_ = std::max(nextPinId_, pin.id + 1);
+        }
+        for (const Pin& pin : node.outputs)
+        {
+            nextPinId_ = std::max(nextPinId_, pin.id + 1);
+        }
+    }
+    MarkDirty("Project nodes loaded");
+}
+
 void NodeGraph::ReplaceLinks(std::vector<Link> links)
 {
     links_ = std::move(links);
@@ -331,7 +431,8 @@ bool NodeGraph::SetPreviewStage(PreviewStage stage)
     }
 
     evaluation_.previewStage = stage;
-    MarkDirty(std::format("Preview stage changed to {}", ToString(stage)));
+    evaluation_.dirty = true;
+    evaluation_.status = std::format("Preview stage changed to {}", ToString(stage));
     return true;
 }
 
@@ -369,6 +470,7 @@ SdfPipeline NodeGraph::FinalPipeline() const
 void NodeGraph::MarkDirty(std::string_view reason)
 {
     evaluation_.dirty = true;
+    evaluation_.finalDirty = true;
     evaluation_.status = std::string(reason);
 }
 
@@ -376,6 +478,14 @@ const Node* NodeGraph::FindFirstNode(NodeKind kind) const
 {
     const auto it = std::ranges::find_if(nodes_, [kind](const Node& node) {
         return node.kind == kind;
+    });
+    return it != nodes_.end() ? &*it : nullptr;
+}
+
+Node* NodeGraph::FindMutableNode(GraphId nodeId)
+{
+    const auto it = std::ranges::find_if(nodes_, [nodeId](const Node& node) {
+        return node.id == nodeId;
     });
     return it != nodes_.end() ? &*it : nullptr;
 }
@@ -429,6 +539,7 @@ SdfPipeline NodeGraph::PipelineTo(NodeKind targetKind) const
         else if (node->kind == NodeKind::OutputMesh)
         {
             pipeline.applyOutputIso = true;
+            pipeline.outputIsoValue = node->outputMesh.isoValue;
         }
         else if (node->kind == NodeKind::PrimitiveSdf)
         {
@@ -440,25 +551,23 @@ SdfPipeline NodeGraph::PipelineTo(NodeKind targetKind) const
     return pipeline;
 }
 
-void NodeGraph::Evaluate()
+void NodeGraph::Evaluate(int previewMeshResolution)
 {
-    const int previewMeshResolution = EffectiveMeshResolution(settings_.preview);
-    const int outputMeshResolution = EffectiveMeshResolution(settings_.outputMesh);
+    if (previewMeshResolution <= 0)
+    {
+        previewMeshResolution = EffectiveMeshResolution(settings_.preview);
+    }
     const SdfPipeline previewPipeline = PreviewPipeline();
     const SdfPipeline finalPipeline = FinalPipeline();
-    GraphSettings finalSettings = settings_;
-    finalSettings.preview.displayMode = MeshDisplayMode::Mesh;
     evaluation_.requestedPreviewBackend = settings_.previewBackend;
     evaluation_.effectivePreviewBackend = ComputeBackend::Cpu;
     evaluation_.previewBackendFallback = settings_.previewBackend != ComputeBackend::Cpu;
     evaluation_.previewSdf = BuildDenseSdfPreview(settings_, previewPipeline, previewMeshResolution);
-    evaluation_.finalSdf = BuildDenseSdfPreview(finalSettings, finalPipeline, outputMeshResolution);
     evaluation_.previewMesh = BuildMeshFromSdf(settings_, previewPipeline, evaluation_.previewSdf);
-    evaluation_.finalMesh = BuildMeshFromSdf(finalSettings, finalPipeline, evaluation_.finalSdf);
     ++evaluation_.version;
     evaluation_.dirty = false;
     evaluation_.status = std::format(
-        "{} preview [{}{}] -> {}{}{} -> preview LOD {} / output LOD {} / iso {:.3f} -> {} verts / {} tris",
+        "{} preview [{}{}] -> {}{}{} -> preview LOD {} / output LOD {} / iso {:.3f} -> {} verts / {} tris{}",
         ToString(evaluation_.previewStage),
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
@@ -466,30 +575,53 @@ void NodeGraph::Evaluate()
         finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", settings_.noise.amplitude, settings_.noise.frequency, settings_.noise.octaves) : "",
         finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", settings_.crack.width, settings_.crack.depth, settings_.crack.roughness) : "",
         settings_.preview.lod,
-        settings_.outputMesh.lod,
-        settings_.outputMesh.isoValue,
+        OutputMeshSettingsFor().lod,
+        OutputMeshSettingsFor().isoValue,
         evaluation_.previewMesh.vertices.size(),
-        evaluation_.previewMesh.triangles.size());
+        evaluation_.previewMesh.triangles.size(),
+        evaluation_.finalDirty ? " / output mesh pending" : "");
+}
+
+void NodeGraph::EvaluateFinal(GraphId outputNodeId)
+{
+    const OutputMeshSettings& outputMesh = OutputMeshSettingsFor(outputNodeId);
+    const int outputMeshResolution = EffectiveMeshResolution(outputMesh);
+    SdfPipeline finalPipeline = FinalPipeline();
+    if (finalPipeline.applyOutputIso)
+    {
+        finalPipeline.outputIsoValue = outputMesh.isoValue;
+    }
+    GraphSettings finalSettings = settings_;
+    finalSettings.preview.displayMode = MeshDisplayMode::Mesh;
+    evaluation_.finalSdf = BuildDenseSdfPreview(finalSettings, finalPipeline, outputMeshResolution);
+    evaluation_.finalMesh = BuildMeshFromSdf(finalSettings, finalPipeline, evaluation_.finalSdf);
+    ++evaluation_.finalVersion;
+    evaluation_.finalDirty = false;
+    evaluation_.status = std::format(
+        "{} preview [{}{}] / output mesh {}^3 LOD {} iso {:.3f} -> {} verts / {} tris",
+        ToString(evaluation_.previewStage),
+        ToString(evaluation_.effectivePreviewBackend),
+        evaluation_.previewBackendFallback ? " fallback" : "",
+        evaluation_.finalSdf.resolution,
+        outputMesh.lod,
+        outputMesh.isoValue,
+        evaluation_.finalMesh.vertices.size(),
+        evaluation_.finalMesh.triangles.size());
 }
 
 void NodeGraph::EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend requestedBackend, ComputeBackend effectiveBackend, bool fallback)
 {
-    const int outputMeshResolution = EffectiveMeshResolution(settings_.outputMesh);
     const SdfPipeline previewPipeline = PreviewPipeline();
     const SdfPipeline finalPipeline = FinalPipeline();
-    GraphSettings finalSettings = settings_;
-    finalSettings.preview.displayMode = MeshDisplayMode::Mesh;
     evaluation_.requestedPreviewBackend = requestedBackend;
     evaluation_.effectivePreviewBackend = effectiveBackend;
     evaluation_.previewBackendFallback = fallback;
     evaluation_.previewSdf = std::move(previewSdf);
-    evaluation_.finalSdf = BuildDenseSdfPreview(finalSettings, finalPipeline, outputMeshResolution);
     evaluation_.previewMesh = BuildMeshFromSdf(settings_, previewPipeline, evaluation_.previewSdf);
-    evaluation_.finalMesh = BuildMeshFromSdf(finalSettings, finalPipeline, evaluation_.finalSdf);
     ++evaluation_.version;
     evaluation_.dirty = false;
     evaluation_.status = std::format(
-        "{} preview [{}{}] -> {}{}{} -> preview LOD {} / output LOD {} / iso {:.3f} -> {} verts / {} tris",
+        "{} preview [{}{}] -> {}{}{} -> preview LOD {} / output LOD {} / iso {:.3f} -> {} verts / {} tris{}",
         ToString(evaluation_.previewStage),
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
@@ -497,10 +629,11 @@ void NodeGraph::EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend r
         finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", settings_.noise.amplitude, settings_.noise.frequency, settings_.noise.octaves) : "",
         finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", settings_.crack.width, settings_.crack.depth, settings_.crack.roughness) : "",
         settings_.preview.lod,
-        settings_.outputMesh.lod,
-        settings_.outputMesh.isoValue,
+        OutputMeshSettingsFor().lod,
+        OutputMeshSettingsFor().isoValue,
         evaluation_.previewMesh.vertices.size(),
-        evaluation_.previewMesh.triangles.size());
+        evaluation_.previewMesh.triangles.size(),
+        evaluation_.finalDirty ? " / output mesh pending" : "");
 }
 
 GraphId NodeGraph::AddNode(NodeKind kind, std::string title)

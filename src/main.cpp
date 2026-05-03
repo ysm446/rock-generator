@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -89,6 +90,7 @@ std::vector<std::pair<rock::GraphId, ImVec2>> g_nodePositionCache;
 std::vector<rock::GraphId> g_pendingSelectedNodeIds;
 rock::UiThemeManager g_themeManager;
 rock::GraphId g_selectedNodeId = 0;
+rock::GraphId g_lastFinalOutputNodeId = 0;
 
 struct UiState
 {
@@ -629,6 +631,8 @@ std::filesystem::path MeshPreviewShaderPath()
 }
 
 void EvaluateGraph();
+void EnsureFinalMesh(rock::GraphId outputNodeId = 0);
+int CurrentPreviewMeshResolution();
 void ResetViewport();
 ImVec2 InitialNodePosition(rock::NodeKind kind);
 
@@ -939,13 +943,23 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
                 {"depth", settings.crack.depth},
                 {"roughness", settings.crack.roughness},
             }},
-            {"outputMesh", {
-                {"resolution", settings.outputMesh.resolution},
-                {"lod", settings.outputMesh.lod},
-                {"isoValue", settings.outputMesh.isoValue},
-            }},
             {"previewBackend", static_cast<int>(settings.previewBackend)},
         };
+
+        root["nodeSettings"] = nlohmann::json::object();
+        for (const rock::Node& node : g_graph.Nodes())
+        {
+            if (node.kind == rock::NodeKind::OutputMesh)
+            {
+                root["nodeSettings"][std::to_string(node.id)] = {
+                    {"outputMesh", {
+                        {"resolution", node.outputMesh.resolution},
+                        {"lod", node.outputMesh.lod},
+                        {"isoValue", node.outputMesh.isoValue},
+                    }},
+                };
+            }
+        }
 
         root["viewport"] = {
             {"yaw", g_viewport.yaw},
@@ -955,6 +969,40 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
             {"zoom", g_viewport.zoom},
             {"pan", {g_viewport.pan.x, g_viewport.pan.y}},
         };
+
+        root["nodes"] = nlohmann::json::array();
+        for (const rock::Node& node : g_graph.Nodes())
+        {
+            nlohmann::json nodeJson = {
+                {"id", node.id},
+                {"kind", static_cast<int>(node.kind)},
+                {"title", node.title},
+                {"inputs", nlohmann::json::array()},
+                {"outputs", nlohmann::json::array()},
+                {"outputMesh", {
+                    {"resolution", node.outputMesh.resolution},
+                    {"lod", node.outputMesh.lod},
+                    {"isoValue", node.outputMesh.isoValue},
+                }},
+            };
+            for (const rock::Pin& pin : node.inputs)
+            {
+                nodeJson["inputs"].push_back({
+                    {"id", pin.id},
+                    {"valueType", static_cast<int>(pin.valueType)},
+                    {"label", pin.label},
+                });
+            }
+            for (const rock::Pin& pin : node.outputs)
+            {
+                nodeJson["outputs"].push_back({
+                    {"id", pin.id},
+                    {"valueType", static_cast<int>(pin.valueType)},
+                    {"label", pin.label},
+                });
+            }
+            root["nodes"].push_back(std::move(nodeJson));
+        }
 
         root["links"] = nlohmann::json::array();
         for (const rock::Link& link : g_graph.Links())
@@ -1065,6 +1113,50 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         const nlohmann::json noiseJson = settingsJson.value("noise", nlohmann::json::object());
         const nlohmann::json crackJson = settingsJson.value("crack", nlohmann::json::object());
         const nlohmann::json outputMeshJson = settingsJson.value("outputMesh", nlohmann::json::object());
+        const nlohmann::json nodesJson = root.value("nodes", nlohmann::json::array());
+        if (nodesJson.is_array() && !nodesJson.empty())
+        {
+            std::vector<rock::Node> nodes;
+            for (const nlohmann::json& nodeJson : nodesJson)
+            {
+                rock::Node node;
+                node.id = nodeJson.value("id", 0);
+                node.kind = static_cast<rock::NodeKind>(std::clamp(nodeJson.value("kind", 0), 0, 3));
+                node.title = nodeJson.value("title", std::string(rock::ToString(node.kind)));
+                const nlohmann::json nodeOutputMeshJson = nodeJson.value("outputMesh", nlohmann::json::object());
+                node.outputMesh.resolution = std::clamp(nodeOutputMeshJson.value("resolution", node.outputMesh.resolution), 16, 96);
+                node.outputMesh.lod = std::clamp(nodeOutputMeshJson.value("lod", node.outputMesh.lod), 0, 4);
+                node.outputMesh.isoValue = std::clamp(nodeOutputMeshJson.value("isoValue", node.outputMesh.isoValue), -0.2f, 0.2f);
+
+                const auto readPins = [&](const nlohmann::json& pinsJson, rock::PinKind pinKind, std::vector<rock::Pin>& pins) {
+                    if (!pinsJson.is_array())
+                    {
+                        return;
+                    }
+                    for (const nlohmann::json& pinJson : pinsJson)
+                    {
+                        rock::Pin pin;
+                        pin.id = pinJson.value("id", 0);
+                        pin.nodeId = node.id;
+                        pin.kind = pinKind;
+                        pin.valueType = static_cast<rock::ValueType>(std::clamp(pinJson.value("valueType", 0), 0, 1));
+                        pin.label = pinJson.value("label", std::string(rock::ToString(pin.valueType)));
+                        pins.push_back(std::move(pin));
+                    }
+                };
+                readPins(nodeJson.value("inputs", nlohmann::json::array()), rock::PinKind::Input, node.inputs);
+                readPins(nodeJson.value("outputs", nlohmann::json::array()), rock::PinKind::Output, node.outputs);
+                if (node.id != 0)
+                {
+                    nodes.push_back(std::move(node));
+                }
+            }
+            if (!nodes.empty())
+            {
+                g_graph.ReplaceNodes(std::move(nodes));
+            }
+        }
+        rock::OutputMeshSettings legacyOutputMesh = g_graph.OutputMeshSettingsFor();
         settings.primitive.kind = static_cast<rock::PrimitiveKind>(std::clamp(primitiveJson.value("kind", static_cast<int>(settings.primitive.kind)), 0, 4));
         settings.noise.amplitude = noiseJson.value("amplitude", settings.noise.amplitude);
         settings.noise.frequency = noiseJson.value("frequency", settings.noise.frequency);
@@ -1072,9 +1164,28 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         settings.crack.width = crackJson.value("width", settings.crack.width);
         settings.crack.depth = crackJson.value("depth", settings.crack.depth);
         settings.crack.roughness = crackJson.value("roughness", settings.crack.roughness);
-        settings.outputMesh.resolution = std::clamp(outputMeshJson.value("resolution", settings.outputMesh.resolution), 16, 96);
-        settings.outputMesh.lod = std::clamp(outputMeshJson.value("lod", settings.outputMesh.lod), 0, 4);
-        settings.outputMesh.isoValue = std::clamp(outputMeshJson.value("isoValue", settings.outputMesh.isoValue), -0.2f, 0.2f);
+        legacyOutputMesh.resolution = std::clamp(outputMeshJson.value("resolution", legacyOutputMesh.resolution), 16, 96);
+        legacyOutputMesh.lod = std::clamp(outputMeshJson.value("lod", legacyOutputMesh.lod), 0, 4);
+        legacyOutputMesh.isoValue = std::clamp(outputMeshJson.value("isoValue", legacyOutputMesh.isoValue), -0.2f, 0.2f);
+        for (const rock::Node& node : g_graph.Nodes())
+        {
+            if (rock::OutputMeshSettings* nodeOutputMesh = g_graph.FindOutputMeshSettings(node.id))
+            {
+                *nodeOutputMesh = legacyOutputMesh;
+            }
+        }
+        const nlohmann::json nodeSettingsJson = root.value("nodeSettings", nlohmann::json::object());
+        for (const auto& [nodeIdText, nodeSettingsJsonValue] : nodeSettingsJson.items())
+        {
+            const int nodeId = std::stoi(nodeIdText);
+            if (rock::OutputMeshSettings* nodeOutputMesh = g_graph.FindOutputMeshSettings(nodeId))
+            {
+                const nlohmann::json nodeOutputMeshJson = nodeSettingsJsonValue.value("outputMesh", nlohmann::json::object());
+                nodeOutputMesh->resolution = std::clamp(nodeOutputMeshJson.value("resolution", nodeOutputMesh->resolution), 16, 96);
+                nodeOutputMesh->lod = std::clamp(nodeOutputMeshJson.value("lod", nodeOutputMesh->lod), 0, 4);
+                nodeOutputMesh->isoValue = std::clamp(nodeOutputMeshJson.value("isoValue", nodeOutputMesh->isoValue), -0.2f, 0.2f);
+            }
+        }
         settings.previewBackend = static_cast<rock::ComputeBackend>(std::clamp(settingsJson.value("previewBackend", static_cast<int>(settings.previewBackend)), 0, 2));
 
         const nlohmann::json viewportJson = root.value("viewport", nlohmann::json::object());
@@ -1452,7 +1563,7 @@ bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, const rock::SdfP
         constants.crackWidth = settings.crack.width;
         constants.crackDepth = settings.crack.depth;
         constants.crackRoughness = settings.crack.roughness;
-        constants.isoValue = settings.outputMesh.isoValue;
+        constants.isoValue = pipeline.outputIsoValue;
 
         commandList->SetComputeRootSignature(g_sdfComputeRootSignature.Get());
         commandList->SetPipelineState(g_sdfComputePipelineState.Get());
@@ -1495,25 +1606,55 @@ bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, const rock::SdfP
     }
 }
 
+int EffectiveMeshResolution(int resolution, int lod)
+{
+    return std::clamp(resolution / (1 << std::clamp(lod, 0, 4)), 16, 96);
+}
+
+int CurrentPreviewMeshResolution()
+{
+    if (const rock::Node* selectedNode = g_graph.FindNode(g_selectedNodeId);
+        selectedNode != nullptr && selectedNode->kind == rock::NodeKind::OutputMesh)
+    {
+        const rock::OutputMeshSettings& outputMesh = g_graph.OutputMeshSettingsFor(selectedNode->id);
+        return EffectiveMeshResolution(outputMesh.resolution, outputMesh.lod);
+    }
+
+    const rock::PreviewSettings& preview = g_graph.Settings().preview;
+    return EffectiveMeshResolution(preview.resolution, preview.lod);
+}
+
 void EvaluateGraph()
 {
     const rock::GraphSettings& settings = g_graph.Settings();
+    const int meshResolution = CurrentPreviewMeshResolution();
     if (settings.previewBackend == rock::ComputeBackend::Cpu)
     {
-        g_graph.Evaluate();
+        g_graph.Evaluate(meshResolution);
         return;
     }
 
     rock::SdfPreviewStats gpuPreview;
     std::string error;
-    const int meshResolution = std::clamp(settings.preview.resolution / (1 << std::clamp(settings.preview.lod, 0, 4)), 16, 96);
     if (TryBuildGpuPreviewSdf(settings, g_graph.PreviewPipeline(), meshResolution, gpuPreview, &error))
     {
         g_graph.EvaluateWithPreview(std::move(gpuPreview), settings.previewBackend, rock::ComputeBackend::GpuPreview, false);
         return;
     }
 
-    g_graph.Evaluate();
+    g_graph.Evaluate(meshResolution);
+}
+
+void EnsureFinalMesh(rock::GraphId outputNodeId)
+{
+    if (g_graph.Evaluation().dirty)
+    {
+        EvaluateGraph();
+    }
+    if (g_graph.Evaluation().finalDirty)
+    {
+        g_graph.EvaluateFinal(outputNodeId);
+    }
 }
 
 void ResetViewport()
@@ -2088,7 +2229,7 @@ bool RenderGpuRaymarchPreview(const ImVec2& min, const ImVec2& max, std::string*
         constants.crackWidth = settings.crack.width;
         constants.crackDepth = settings.crack.depth;
         constants.crackRoughness = settings.crack.roughness;
-        constants.isoValue = settings.outputMesh.isoValue;
+        constants.isoValue = pipeline.outputIsoValue;
         constants.cameraPosition[0] = basis.position.x;
         constants.cameraPosition[1] = basis.position.y;
         constants.cameraPosition[2] = basis.position.z;
@@ -2871,6 +3012,7 @@ void DrawNodeGraphDots(const ImVec2& screenMin, const ImVec2& screenMax)
 
 void DrawNodeGraph()
 {
+    static ImVec2 addNodePosition(0.0f, 0.0f);
     ed::SetCurrentEditor(g_nodeEditor);
     const ImVec2 canvasMin = ImGui::GetCursorScreenPos();
     const ImVec2 canvasMax(canvasMin.x + ImGui::GetContentRegionAvail().x, canvasMin.y + ImGui::GetContentRegionAvail().y);
@@ -2969,6 +3111,7 @@ void DrawNodeGraph()
 
     if (ed::BeginDelete())
     {
+        bool graphChanged = false;
         ed::LinkId deletedLinkId;
         while (ed::QueryDeletedLink(&deletedLinkId))
         {
@@ -2977,12 +3120,74 @@ void DrawNodeGraph()
                 const int linkId = ToGraphId(deletedLinkId.Get());
                 if (g_graph.DeleteLink(linkId))
                 {
-                    EvaluateGraph();
+                    graphChanged = true;
                 }
             }
         }
+        ed::NodeId deletedNodeId;
+        while (ed::QueryDeletedNode(&deletedNodeId))
+        {
+            if (ed::AcceptDeletedItem())
+            {
+                const int nodeId = ToGraphId(deletedNodeId.Get());
+                if (g_graph.DeleteNode(nodeId))
+                {
+                    graphChanged = true;
+                    if (g_selectedNodeId == nodeId)
+                    {
+                        g_selectedNodeId = 0;
+                    }
+                    if (g_lastFinalOutputNodeId == nodeId)
+                    {
+                        g_lastFinalOutputNodeId = 0;
+                    }
+                    std::erase_if(g_nodePositionCache, [nodeId](const auto& entry) {
+                        return entry.first == nodeId;
+                    });
+                }
+            }
+        }
+        if (graphChanged)
+        {
+            EvaluateGraph();
+        }
     }
     ed::EndDelete();
+
+    if (ed::ShowBackgroundContextMenu())
+    {
+        addNodePosition = ed::ScreenToCanvas(ImVec2(
+            (canvasMin.x + canvasMax.x) * 0.5f,
+            (canvasMin.y + canvasMax.y) * 0.5f));
+        ed::Suspend();
+        ImGui::OpenPopup("AddNodeContextMenu");
+        ed::Resume();
+    }
+
+    ed::Suspend();
+    if (ImGui::BeginPopup("AddNodeContextMenu"))
+    {
+        ImGui::TextDisabled("ノードを追加");
+        ImGui::Separator();
+        const auto addNodeMenuItem = [&](rock::NodeKind kind) {
+            if (ImGui::MenuItem(rock::ToString(kind).data()))
+            {
+                const rock::GraphId nodeId = g_graph.CreateNode(kind);
+                g_pendingNodePositions.push_back({nodeId, addNodePosition});
+                g_pendingSelectedNodeIds = {nodeId};
+                g_selectedNodeId = nodeId;
+                g_lastFinalOutputNodeId = 0;
+                g_projectStatus = "Added " + std::string(rock::ToString(kind));
+                EvaluateGraph();
+            }
+        };
+        addNodeMenuItem(rock::NodeKind::PrimitiveSdf);
+        addNodeMenuItem(rock::NodeKind::NoiseWarp);
+        addNodeMenuItem(rock::NodeKind::CrackField);
+        addNodeMenuItem(rock::NodeKind::OutputMesh);
+        ImGui::EndPopup();
+    }
+    ed::Resume();
 
     ed::NodeId selectedNodes[1];
     if (ed::GetSelectedNodes(selectedNodes, 1) > 0)
@@ -2995,11 +3200,17 @@ void DrawNodeGraph()
             {
                 EvaluateGraph();
             }
+            if (selectedNode->kind == rock::NodeKind::OutputMesh && g_lastFinalOutputNodeId != selectedNodeId)
+            {
+                g_lastFinalOutputNodeId = selectedNodeId;
+                EnsureFinalMesh(selectedNodeId);
+            }
         }
     }
     else
     {
         g_selectedNodeId = 0;
+        g_lastFinalOutputNodeId = 0;
     }
 
     ed::End();
@@ -3028,7 +3239,32 @@ bool DrawPropertyComboRow(const char* label, const char* id, int* value, const c
     return changed;
 }
 
-bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, const char* dirtyReason)
+bool DrawResetToDefaultButton(const char* id)
+{
+    ImGui::SameLine();
+    ImGui::PushID(id);
+    const float buttonSize = ImGui::GetFrameHeight();
+    const bool pressed = ImGui::Button("##resetDefault", ImVec2(buttonSize, buttonSize));
+    const char* resetIcon = "↺";
+    ImFont* font = ImGui::GetFont();
+    const float iconFontSize = ImGui::GetFontSize() * 1.25f;
+    const ImVec2 iconSize = font->CalcTextSizeA(iconFontSize, FLT_MAX, 0.0f, resetIcon);
+    const ImVec2 buttonMin = ImGui::GetItemRectMin();
+    const ImVec2 buttonMax = ImGui::GetItemRectMax();
+    const ImVec2 iconPos = {
+        buttonMin.x + ((buttonMax.x - buttonMin.x) - iconSize.x) * 0.5f,
+        buttonMin.y + ((buttonMax.y - buttonMin.y) - iconSize.y) * 0.5f,
+    };
+    ImGui::GetWindowDrawList()->AddText(font, iconFontSize, iconPos, ImGui::GetColorU32(ImGuiCol_Text), resetIcon);
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::SetTooltip("既定値に戻す");
+    }
+    ImGui::PopID();
+    return pressed;
+}
+
+bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, float defaultValue, const char* dirtyReason)
 {
     bool editEnded = false;
     ImGui::TableNextRow();
@@ -3040,8 +3276,9 @@ bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float
     ImGui::PushID(id);
     const float inputWidth = 76.0f;
     const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float resetWidth = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x;
     const float sliderWidth = std::clamp(
-        availableWidth - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x,
+        availableWidth - inputWidth - resetWidth - ImGui::GetStyle().ItemInnerSpacing.x,
         80.0f,
         180.0f);
     ImGui::SetNextItemWidth(sliderWidth);
@@ -3059,11 +3296,17 @@ bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float
         g_graph.MarkDirty(dirtyReason);
     }
     editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
+    if (DrawResetToDefaultButton("reset"))
+    {
+        *value = std::clamp(defaultValue, minValue, maxValue);
+        g_graph.MarkDirty(dirtyReason);
+        editEnded = true;
+    }
     ImGui::PopID();
     return editEnded;
 }
 
-bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minValue, int maxValue, const char* dirtyReason)
+bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minValue, int maxValue, int defaultValue, const char* dirtyReason)
 {
     bool editEnded = false;
     ImGui::TableNextRow();
@@ -3075,8 +3318,9 @@ bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minVa
     ImGui::PushID(id);
     const float inputWidth = 58.0f;
     const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float resetWidth = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x;
     const float sliderWidth = std::clamp(
-        availableWidth - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x,
+        availableWidth - inputWidth - resetWidth - ImGui::GetStyle().ItemInnerSpacing.x,
         80.0f,
         180.0f);
     ImGui::SetNextItemWidth(sliderWidth);
@@ -3094,6 +3338,12 @@ bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minVa
         g_graph.MarkDirty(dirtyReason);
     }
     editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
+    if (DrawResetToDefaultButton("reset"))
+    {
+        *value = std::clamp(defaultValue, minValue, maxValue);
+        g_graph.MarkDirty(dirtyReason);
+        editEnded = true;
+    }
     ImGui::PopID();
     return editEnded;
 }
@@ -3116,7 +3366,7 @@ bool DrawPropertyBoolRow(const char* label, const char* id, bool* value, const c
     return changed;
 }
 
-void DrawCameraFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, const char* format = "%.2f")
+void DrawCameraFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, float defaultValue, const char* format = "%.2f")
 {
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
@@ -3127,8 +3377,9 @@ void DrawCameraFloatRow(const char* label, const char* id, float* value, float m
     ImGui::PushID(id);
     const float inputWidth = 76.0f;
     const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float resetWidth = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x;
     const float sliderWidth = std::clamp(
-        availableWidth - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x,
+        availableWidth - inputWidth - resetWidth - ImGui::GetStyle().ItemInnerSpacing.x,
         80.0f,
         180.0f);
     ImGui::SetNextItemWidth(sliderWidth);
@@ -3138,6 +3389,10 @@ void DrawCameraFloatRow(const char* label, const char* id, float* value, float m
     if (ImGui::InputFloat("##number", value, 0.0f, 0.0f, format))
     {
         *value = std::clamp(*value, minValue, maxValue);
+    }
+    if (DrawResetToDefaultButton("reset"))
+    {
+        *value = std::clamp(defaultValue, minValue, maxValue);
     }
     ImGui::PopID();
 }
@@ -3180,15 +3435,15 @@ void DrawPropertiesPanel()
         ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
-        if (DrawPropertyFloatRow("Amplitude", "NoiseAmplitude", &settings.noise.amplitude, 0.0f, 2.0f, "Noise amplitude changed"))
+        if (DrawPropertyFloatRow("Amplitude", "NoiseAmplitude", &settings.noise.amplitude, 0.0f, 2.0f, rock::NoiseSettings{}.amplitude, "Noise amplitude changed"))
         {
             EvaluateGraph();
         }
-        if (DrawPropertyFloatRow("Frequency", "NoiseFrequency", &settings.noise.frequency, 0.1f, 12.0f, "Noise frequency changed"))
+        if (DrawPropertyFloatRow("Frequency", "NoiseFrequency", &settings.noise.frequency, 0.1f, 12.0f, rock::NoiseSettings{}.frequency, "Noise frequency changed"))
         {
             EvaluateGraph();
         }
-        if (DrawPropertyIntRow("Octaves", "NoiseOctaves", &settings.noise.octaves, 1, 8, "Noise octaves changed"))
+        if (DrawPropertyIntRow("Octaves", "NoiseOctaves", &settings.noise.octaves, 1, 8, rock::NoiseSettings{}.octaves, "Noise octaves changed"))
         {
             EvaluateGraph();
         }
@@ -3202,15 +3457,15 @@ void DrawPropertiesPanel()
         ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
-        if (DrawPropertyFloatRow("Width", "CrackWidth", &settings.crack.width, 0.0f, 0.2f, "Crack width changed"))
+        if (DrawPropertyFloatRow("Width", "CrackWidth", &settings.crack.width, 0.0f, 0.2f, rock::CrackSettings{}.width, "Crack width changed"))
         {
             EvaluateGraph();
         }
-        if (DrawPropertyFloatRow("Depth", "CrackDepth", &settings.crack.depth, 0.0f, 1.0f, "Crack depth changed"))
+        if (DrawPropertyFloatRow("Depth", "CrackDepth", &settings.crack.depth, 0.0f, 1.0f, rock::CrackSettings{}.depth, "Crack depth changed"))
         {
             EvaluateGraph();
         }
-        if (DrawPropertyFloatRow("Roughness", "CrackRoughness", &settings.crack.roughness, 0.0f, 1.0f, "Crack roughness changed"))
+        if (DrawPropertyFloatRow("Roughness", "CrackRoughness", &settings.crack.roughness, 0.0f, 1.0f, rock::CrackSettings{}.roughness, "Crack roughness changed"))
         {
             EvaluateGraph();
         }
@@ -3221,33 +3476,27 @@ void DrawPropertiesPanel()
 
     if (selectedNode->kind == rock::NodeKind::OutputMesh)
     {
-        ImGui::TextDisabled("メッシュ生成設定はメッシュ設定タブに移動しました。");
-        ImGui::TextDisabled("書き出し操作はエクスポートタブから実行できます。");
-    }
-}
-
-void DrawMeshSettingsPanel()
-{
-    rock::GraphSettings& settings = g_graph.Settings();
-    if (ImGui::BeginTable("MeshSettingsRows", 2, ImGuiTableFlags_SizingStretchProp))
-    {
-        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
-
-        if (DrawPropertyIntRow("Output Resolution", "MeshSettingsOutputResolution", &settings.outputMesh.resolution, 16, 96, "Output mesh resolution changed"))
+        rock::OutputMeshSettings* outputMesh = g_graph.FindOutputMeshSettings(selectedNode->id);
+        if (outputMesh != nullptr && ImGui::BeginTable("OutputMeshRows", 2, ImGuiTableFlags_SizingStretchProp))
         {
-            EvaluateGraph();
-        }
-        if (DrawPropertyIntRow("Output LOD", "MeshSettingsOutputLod", &settings.outputMesh.lod, 0, 4, "Output mesh LOD changed"))
-        {
-            EvaluateGraph();
-        }
-        if (DrawPropertyFloatRow("Iso Value", "MeshSettingsIsoValue", &settings.outputMesh.isoValue, -0.2f, 0.2f, "Output mesh iso value changed"))
-        {
-            EvaluateGraph();
-        }
+            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
-        ImGui::EndTable();
+            if (DrawPropertyIntRow("Resolution", "OutputMeshResolution", &outputMesh->resolution, 16, 96, rock::OutputMeshSettings{}.resolution, "Output mesh resolution changed"))
+            {
+                EvaluateGraph();
+            }
+            if (DrawPropertyIntRow("LOD", "OutputMeshLod", &outputMesh->lod, 0, 4, rock::OutputMeshSettings{}.lod, "Output mesh LOD changed"))
+            {
+                EvaluateGraph();
+            }
+            if (DrawPropertyFloatRow("Iso Value", "OutputMeshIsoValue", &outputMesh->isoValue, -0.2f, 0.2f, rock::OutputMeshSettings{}.isoValue, "Output mesh iso value changed"))
+            {
+                EvaluateGraph();
+            }
+
+            ImGui::EndTable();
+        }
     }
 }
 
@@ -3267,12 +3516,12 @@ void DrawDisplaySettingsPanel()
         {
             SaveAppSettingsSilently();
         }
-        if (DrawPropertyIntRow("Resolution", "DisplayPreviewResolution", &settings.preview.resolution, 16, 96, "Preview resolution changed"))
+        if (DrawPropertyIntRow("Resolution", "DisplayPreviewResolution", &settings.preview.resolution, 16, 96, rock::PreviewSettings{}.resolution, "Preview resolution changed"))
         {
             EvaluateGraph();
             SaveAppSettingsSilently();
         }
-        if (DrawPropertyIntRow("LOD", "DisplayPreviewLod", &settings.preview.lod, 0, 4, "Preview LOD changed"))
+        if (DrawPropertyIntRow("LOD", "DisplayPreviewLod", &settings.preview.lod, 0, 4, rock::PreviewSettings{}.lod, "Preview LOD changed"))
         {
             EvaluateGraph();
             SaveAppSettingsSilently();
@@ -3320,11 +3569,11 @@ void DrawCameraPanel()
         ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
-        DrawCameraFloatRow("FOV", "FovDegrees", &g_viewport.fovDegrees, 15.0f, 90.0f, "%.1f");
-        DrawCameraFloatRow("Distance", "OrbitDistance", &g_viewport.orbitDistance, 1.0f, 40.0f, "%.2f");
-        DrawCameraFloatRow("Zoom", "ViewportZoom", &g_viewport.zoom, 0.35f, 4.0f, "%.2f");
-        DrawCameraFloatRow("Yaw", "ViewportYaw", &g_viewport.yaw, -3.14159f, 3.14159f, "%.3f");
-        DrawCameraFloatRow("Pitch", "ViewportPitch", &g_viewport.pitch, -1.25f, 1.25f, "%.3f");
+        DrawCameraFloatRow("FOV", "FovDegrees", &g_viewport.fovDegrees, 15.0f, 90.0f, 45.0f, "%.1f");
+        DrawCameraFloatRow("Distance", "OrbitDistance", &g_viewport.orbitDistance, 1.0f, 40.0f, 8.0f, "%.2f");
+        DrawCameraFloatRow("Zoom", "ViewportZoom", &g_viewport.zoom, 0.35f, 4.0f, 1.0f, "%.2f");
+        DrawCameraFloatRow("Yaw", "ViewportYaw", &g_viewport.yaw, -3.14159f, 3.14159f, 0.0f, "%.3f");
+        DrawCameraFloatRow("Pitch", "ViewportPitch", &g_viewport.pitch, -1.25f, 1.25f, 0.0f, "%.3f");
 
         ImGui::EndTable();
     }
@@ -3371,6 +3620,7 @@ void DrawStatsPanel()
     const rock::EvaluationSummary& evaluation = g_graph.Evaluation();
     ImGui::Text("Graph Version: %llu", static_cast<unsigned long long>(evaluation.version));
     ImGui::TextColored(evaluation.dirty ? ImVec4(0.90f, 0.64f, 0.30f, 1.0f) : ImVec4(0.54f, 0.78f, 0.58f, 1.0f), "%s", evaluation.dirty ? "Dirty" : "Evaluated");
+    ImGui::TextColored(evaluation.finalDirty ? ImVec4(0.90f, 0.64f, 0.30f, 1.0f) : ImVec4(0.54f, 0.78f, 0.58f, 1.0f), "%s", evaluation.finalDirty ? "Output Mesh: pending" : "Output Mesh: ready");
     ImGui::TextWrapped("%s", evaluation.status.c_str());
 
     const rock::SdfPreviewStats& previewSdf = evaluation.previewSdf;
@@ -3397,11 +3647,11 @@ void DrawStatsPanel()
 
 void DrawAssetExportPanel()
 {
-    const rock::OutputMeshSettings& outputMesh = g_graph.Settings().outputMesh;
+    const rock::OutputMeshSettings& outputMesh = g_graph.OutputMeshSettingsFor(g_selectedNodeId);
     const int effectiveResolution = std::clamp(outputMesh.resolution / (1 << std::clamp(outputMesh.lod, 0, 4)), 16, 96);
     ImGui::Columns(4, nullptr, false);
     ImGui::TextUnformatted("High mesh");
-    ImGui::Text("%s", g_graph.Evaluation().dirty ? "needs evaluate" : "wire preview");
+    ImGui::Text("%s", g_graph.Evaluation().finalDirty ? "needs build" : "ready");
     ImGui::NextColumn();
     ImGui::TextUnformatted("LOD");
     ImGui::Text("%d / output %d^3", outputMesh.lod, effectiveResolution);
@@ -3412,15 +3662,12 @@ void DrawAssetExportPanel()
     ImGui::TextUnformatted("Export");
     if (ImGui::Button("Build Mesh"))
     {
-        EvaluateGraph();
+        EnsureFinalMesh(g_selectedNodeId);
     }
     ImGui::SameLine();
     if (ImGui::Button("Export OBJ"))
     {
-        if (g_graph.Evaluation().dirty)
-        {
-            EvaluateGraph();
-        }
+        EnsureFinalMesh(g_selectedNodeId);
 
         std::string error;
         const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_mesh.obj";
@@ -3562,7 +3809,7 @@ void DrawUi()
     }
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 8.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 5.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 7.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 6.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(10.0f, 6.0f));
     if (ImGui::BeginMenuBar())
@@ -3659,7 +3906,7 @@ void DrawUi()
                 if (settings.preview.displayMode != mode)
                 {
                     settings.preview.displayMode = mode;
-                    g_graph.MarkDirty("Output mesh display mode changed");
+                    g_graph.MarkDirty("Preview display mode changed");
                     EvaluateGraph();
                 }
                 SaveAppSettingsSilently();
@@ -3739,10 +3986,7 @@ void DrawUi()
         {
             if (ImGui::MenuItem("OBJ"))
             {
-                if (g_graph.Evaluation().dirty)
-                {
-                    EvaluateGraph();
-                }
+                EnsureFinalMesh(g_selectedNodeId);
 
                 std::string error;
                 const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_mesh.obj";
@@ -3837,13 +4081,6 @@ void DrawUi()
         {
             BeginInspectorTabContent();
             DrawStatsPanel();
-            EndInspectorTabContent();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("メッシュ設定"))
-        {
-            BeginInspectorTabContent();
-            DrawMeshSettingsPanel();
             EndInspectorTabContent();
             ImGui::EndTabItem();
         }
