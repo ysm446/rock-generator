@@ -79,6 +79,7 @@ struct NoiseSettings
     float amplitude = 0.35f;
     float frequency = 2.0f;
     int octaves = 4;
+    int seed = 0;
 };
 
 struct CrackSettings
@@ -214,9 +215,27 @@ struct SdfPreviewStats
 
 struct SdfPipeline
 {
+    enum class OperationKind
+    {
+        NoiseWarp = 1,
+        CrackField = 2,
+        OutputIso = 3,
+    };
+
+    struct Operation
+    {
+        OperationKind kind = OperationKind::NoiseWarp;
+        GraphId nodeId = 0;
+        NoiseSettings noise;
+        CrackSettings crack;
+        float isoValue = 0.0f;
+    };
+
     PrimitiveKind primitiveKind = PrimitiveKind::RockBlob;
+    std::vector<Operation> operations;
     bool useNoise = false;
     NoiseSettings noise;
+    std::vector<NoiseSettings> noiseLayers;
     bool useCrack = false;
     CrackSettings crack;
     bool applyOutputIso = false;

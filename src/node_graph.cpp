@@ -13,6 +13,29 @@ namespace rock
 {
 namespace
 {
+std::string NoisePipelineSummary(const SdfPipeline& pipeline)
+{
+    if (pipeline.noiseLayers.empty())
+    {
+        return "";
+    }
+    if (pipeline.noiseLayers.size() == 1)
+    {
+        const NoiseSettings& noise = pipeline.noiseLayers.front();
+        return std::format(" -> noise {:.2f}/{:.2f}/{} seed {}", noise.amplitude, noise.frequency, noise.octaves, noise.seed);
+    }
+    return std::format(" -> noise x{}", pipeline.noiseLayers.size());
+}
+
+std::string OperationPipelineSummary(const SdfPipeline& pipeline)
+{
+    if (pipeline.operations.empty())
+    {
+        return "";
+    }
+    return std::format(" -> {} op{}", pipeline.operations.size(), pipeline.operations.size() == 1 ? "" : "s");
+}
+
 template <typename Settings>
 int EffectiveMeshResolution(const Settings& settings)
 {
@@ -565,18 +588,38 @@ SdfPipeline NodeGraph::PipelineToNode(const Node& targetNode) const
     {
         if (node->kind == NodeKind::NoiseWarp)
         {
-            pipeline.useNoise = true;
-            pipeline.noise = node->noise;
+            pipeline.noiseLayers.push_back(node->noise);
+            pipeline.operations.push_back({
+                SdfPipeline::OperationKind::NoiseWarp,
+                node->id,
+                node->noise,
+                {},
+                0.0f,
+            });
         }
         else if (node->kind == NodeKind::CrackField)
         {
             pipeline.useCrack = true;
             pipeline.crack = node->crack;
+            pipeline.operations.push_back({
+                SdfPipeline::OperationKind::CrackField,
+                node->id,
+                {},
+                node->crack,
+                0.0f,
+            });
         }
         else if (node->kind == NodeKind::OutputMesh)
         {
             pipeline.applyOutputIso = true;
             pipeline.outputIsoValue = node->outputMesh.isoValue;
+            pipeline.operations.push_back({
+                SdfPipeline::OperationKind::OutputIso,
+                node->id,
+                {},
+                {},
+                node->outputMesh.isoValue,
+            });
         }
         else if (node->kind == NodeKind::PrimitiveSdf)
         {
@@ -585,6 +628,13 @@ SdfPipeline NodeGraph::PipelineToNode(const Node& targetNode) const
         }
 
         node = FindUpstreamNode(*node);
+    }
+    std::ranges::reverse(pipeline.noiseLayers);
+    std::ranges::reverse(pipeline.operations);
+    pipeline.useNoise = !pipeline.noiseLayers.empty();
+    if (pipeline.useNoise)
+    {
+        pipeline.noise = pipeline.noiseLayers.back();
     }
     return pipeline;
 }
@@ -610,8 +660,8 @@ void NodeGraph::Evaluate(int previewMeshResolution)
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
         ToString(previewPipeline.primitiveKind),
-        finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", finalPipeline.noise.amplitude, finalPipeline.noise.frequency, finalPipeline.noise.octaves) : "",
-        finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", finalPipeline.crack.width, finalPipeline.crack.depth, finalPipeline.crack.roughness) : "",
+        OperationPipelineSummary(finalPipeline),
+        "",
         settings_.preview.lod,
         OutputMeshSettingsFor().lod,
         OutputMeshSettingsFor().isoValue,
@@ -631,6 +681,13 @@ void NodeGraph::EvaluateFinal(GraphId outputNodeId)
     if (finalPipeline.applyOutputIso)
     {
         finalPipeline.outputIsoValue = outputMesh.isoValue;
+        for (SdfPipeline::Operation& operation : finalPipeline.operations)
+        {
+            if (operation.kind == SdfPipeline::OperationKind::OutputIso)
+            {
+                operation.isoValue = outputMesh.isoValue;
+            }
+        }
     }
     GraphSettings finalSettings = settings_;
     finalSettings.preview.displayMode = MeshDisplayMode::Mesh;
@@ -667,8 +724,8 @@ void NodeGraph::EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend r
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
         ToString(previewPipeline.primitiveKind),
-        finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", finalPipeline.noise.amplitude, finalPipeline.noise.frequency, finalPipeline.noise.octaves) : "",
-        finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", finalPipeline.crack.width, finalPipeline.crack.depth, finalPipeline.crack.roughness) : "",
+        OperationPipelineSummary(finalPipeline),
+        "",
         settings_.preview.lod,
         OutputMeshSettingsFor().lod,
         OutputMeshSettingsFor().isoValue,

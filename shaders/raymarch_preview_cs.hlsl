@@ -3,16 +3,7 @@ cbuffer Settings : register(b0)
     uint width;
     uint height;
     uint primitiveKind;
-    uint noiseOctaves;
-    uint useNoise;
-    uint useCrack;
-    uint applyOutputIso;
-    float noiseAmplitude;
-    float noiseFrequency;
-    float crackWidth;
-    float crackDepth;
-    float crackRoughness;
-    float isoValue;
+    uint sdfOperationCount;
     float preCameraPadding;
     float2 cameraPadding;
     float4 cameraPosition;
@@ -28,6 +19,7 @@ cbuffer Settings : register(b0)
 };
 
 RWTexture2D<float4> gOutput : register(u0);
+ByteAddressBuffer gSdfOperations : register(t0);
 
 float length3(float3 v)
 {
@@ -96,14 +88,18 @@ float primitive_sdf(float3 p)
     return length3(float3(p.x / 0.70, p.y / 0.55, p.z / 0.62)) * 0.58 - 0.58;
 }
 
-float apply_noise(float sdf, float3 p)
+float apply_noise(float sdf, float3 p, float4 op, float4 extra)
 {
-    float n = fbm(p * noiseFrequency, noiseOctaves);
-    return sdf + n * noiseAmplitude * 0.12;
+    float3 seedOffset = extra.x * float3(12.9898, 78.233, 37.719);
+    float n = fbm(p * op.z + seedOffset, (uint)op.w);
+    return sdf + n * op.y * 0.12;
 }
 
-float apply_cracks(float sdf, float3 p)
+float apply_cracks(float sdf, float3 p, float4 op)
 {
+    float crackWidth = op.y;
+    float crackDepth = op.z;
+    float crackRoughness = op.w;
     const float3 normals[3] = {
         float3(0.92, 0.18, 0.34),
         float3(-0.25, 0.96, 0.11),
@@ -125,12 +121,20 @@ float apply_cracks(float sdf, float3 p)
 float evaluate_sdf(float3 p)
 {
     float sdf = primitive_sdf(p);
-    if (useNoise != 0)
-        sdf = apply_noise(sdf, p);
-    if (useCrack != 0)
-        sdf = apply_cracks(sdf, p);
-    if (applyOutputIso != 0)
-        sdf -= isoValue;
+    [loop]
+    for (uint opIndex = 0; opIndex < sdfOperationCount; ++opIndex)
+    {
+        uint byteOffset = opIndex * 32;
+        float4 op = asfloat(gSdfOperations.Load4(byteOffset));
+        float4 extra = asfloat(gSdfOperations.Load4(byteOffset + 16));
+        uint opKind = (uint)(op.x + 0.5);
+        if (opKind == 1)
+            sdf = apply_noise(sdf, p, op, extra);
+        else if (opKind == 2)
+            sdf = apply_cracks(sdf, p, op);
+        else if (opKind == 3)
+            sdf -= op.y;
+    }
     return sdf;
 }
 

@@ -271,18 +271,8 @@ struct SdfComputeConstants
 {
     UINT resolution = 48;
     UINT primitiveKind = 0;
-    UINT noiseOctaves = 4;
-    UINT useNoise = 0;
-    UINT useCrack = 0;
-    UINT applyOutputIso = 0;
+    UINT sdfOperationCount = 0;
     UINT padding0 = 0;
-    float noiseAmplitude = 0.0f;
-    float noiseFrequency = 1.0f;
-    float crackWidth = 0.0f;
-    float crackDepth = 0.0f;
-    float crackRoughness = 0.0f;
-    float isoValue = 0.0f;
-    float padding1[2]{};
 };
 
 struct RaymarchComputeConstants
@@ -290,18 +280,9 @@ struct RaymarchComputeConstants
     UINT width = 0;
     UINT height = 0;
     UINT primitiveKind = 0;
-    UINT noiseOctaves = 4;
-    UINT useNoise = 0;
-    UINT useCrack = 0;
-    UINT applyOutputIso = 0;
-    float noiseAmplitude = 0.0f;
-    float noiseFrequency = 1.0f;
-    float crackWidth = 0.0f;
-    float crackDepth = 0.0f;
-    float crackRoughness = 0.0f;
-    float isoValue = 0.0f;
+    UINT sdfOperationCount = 0;
     float preCameraPadding = 0.0f;
-    float cameraPadding[2]{};
+    float cameraPadding[3]{};
     float cameraPosition[4]{};
     float cameraRight[4]{};
     float cameraUp[4]{};
@@ -899,6 +880,88 @@ void SaveAppSettingsSilently()
     }
 }
 
+struct GpuSdfOperation
+{
+    float params[4]{};
+    float extra[4]{};
+};
+
+std::vector<rock::SdfPipeline::Operation> SdfOperationsForGpu(const rock::SdfPipeline& pipeline)
+{
+    std::vector<rock::SdfPipeline::Operation> operations = pipeline.operations;
+    if (operations.empty())
+    {
+        if (!pipeline.noiseLayers.empty())
+        {
+            for (const rock::NoiseSettings& noise : pipeline.noiseLayers)
+            {
+                operations.push_back({rock::SdfPipeline::OperationKind::NoiseWarp, 0, noise, {}, 0.0f});
+            }
+        }
+        else if (pipeline.useNoise)
+        {
+            operations.push_back({rock::SdfPipeline::OperationKind::NoiseWarp, 0, pipeline.noise, {}, 0.0f});
+        }
+        if (pipeline.useCrack)
+        {
+            operations.push_back({rock::SdfPipeline::OperationKind::CrackField, 0, {}, pipeline.crack, 0.0f});
+        }
+        if (pipeline.applyOutputIso)
+        {
+            operations.push_back({rock::SdfPipeline::OperationKind::OutputIso, 0, {}, {}, pipeline.outputIsoValue});
+        }
+    }
+    return operations;
+}
+
+std::vector<GpuSdfOperation> BuildGpuSdfOperations(const rock::SdfPipeline& pipeline)
+{
+    const std::vector<rock::SdfPipeline::Operation> operations = SdfOperationsForGpu(pipeline);
+    std::vector<GpuSdfOperation> gpuOperations;
+    gpuOperations.reserve(operations.size());
+    for (size_t index = 0; index < operations.size(); ++index)
+    {
+        const rock::SdfPipeline::Operation& operation = operations[index];
+        GpuSdfOperation gpuOperation{};
+        gpuOperation.params[0] = static_cast<float>(static_cast<int>(operation.kind));
+        switch (operation.kind)
+        {
+        case rock::SdfPipeline::OperationKind::NoiseWarp:
+            gpuOperation.params[1] = operation.noise.amplitude;
+            gpuOperation.params[2] = operation.noise.frequency;
+            gpuOperation.params[3] = static_cast<float>(std::clamp(operation.noise.octaves, 1, 8));
+            gpuOperation.extra[0] = static_cast<float>(std::clamp(operation.noise.seed, 0, 999999));
+            break;
+        case rock::SdfPipeline::OperationKind::CrackField:
+            gpuOperation.params[1] = operation.crack.width;
+            gpuOperation.params[2] = operation.crack.depth;
+            gpuOperation.params[3] = operation.crack.roughness;
+            break;
+        case rock::SdfPipeline::OperationKind::OutputIso:
+            gpuOperation.params[1] = operation.isoValue;
+            break;
+        }
+        gpuOperations.push_back(gpuOperation);
+    }
+    return gpuOperations;
+}
+
+ComPtr<ID3D12Resource> CreateUploadBuffer(const void* data, UINT64 byteSize, const char* message)
+{
+    const D3D12_HEAP_PROPERTIES uploadHeap = HeapProperties(D3D12_HEAP_TYPE_UPLOAD);
+    const D3D12_RESOURCE_DESC desc = BufferResourceDesc(std::max<UINT64>(byteSize, 1));
+    ComPtr<ID3D12Resource> buffer;
+    ThrowIfFailed(g_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&buffer)), message);
+    if (byteSize > 0)
+    {
+        void* mapped = nullptr;
+        ThrowIfFailed(buffer->Map(0, nullptr, &mapped), "Map upload buffer failed");
+        std::memcpy(mapped, data, static_cast<size_t>(byteSize));
+        buffer->Unmap(0, nullptr);
+    }
+    return buffer;
+}
+
 bool LoadAppSettings(std::string* error = nullptr)
 {
     try
@@ -1289,6 +1352,7 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
                     {"amplitude", node.noise.amplitude},
                     {"frequency", node.noise.frequency},
                     {"octaves", node.noise.octaves},
+                    {"seed", node.noise.seed},
                 }},
                 {"crack", {
                     {"width", node.crack.width},
@@ -1447,6 +1511,7 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
                 node.noise.amplitude = nodeNoiseJson.value("amplitude", node.noise.amplitude);
                 node.noise.frequency = nodeNoiseJson.value("frequency", node.noise.frequency);
                 node.noise.octaves = std::clamp(nodeNoiseJson.value("octaves", node.noise.octaves), 1, 8);
+                node.noise.seed = std::clamp(nodeNoiseJson.value("seed", node.noise.seed), 0, 999999);
                 node.crack.width = nodeCrackJson.value("width", node.crack.width);
                 node.crack.depth = nodeCrackJson.value("depth", node.crack.depth);
                 node.crack.roughness = nodeCrackJson.value("roughness", node.crack.roughness);
@@ -1631,7 +1696,7 @@ bool EnsureSdfComputePipeline(std::string* error)
         return false;
     }
 
-    D3D12_ROOT_PARAMETER rootParameters[2]{};
+    D3D12_ROOT_PARAMETER rootParameters[3]{};
     rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rootParameters[0].Constants.ShaderRegister = 0;
     rootParameters[0].Constants.RegisterSpace = 0;
@@ -1641,9 +1706,13 @@ bool EnsureSdfComputePipeline(std::string* error)
     rootParameters[1].Descriptor.ShaderRegister = 0;
     rootParameters[1].Descriptor.RegisterSpace = 0;
     rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rootParameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rootParameters[2].Descriptor.ShaderRegister = 0;
+    rootParameters[2].Descriptor.RegisterSpace = 0;
+    rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-    rootDesc.NumParameters = 2;
+    rootDesc.NumParameters = 3;
     rootDesc.pParameters = rootParameters;
     rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -1717,7 +1786,7 @@ bool EnsureRaymarchComputePipeline(std::string* error)
     uavRange.RegisterSpace = 0;
     uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER rootParameters[2]{};
+    D3D12_ROOT_PARAMETER rootParameters[3]{};
     rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rootParameters[0].Constants.ShaderRegister = 0;
     rootParameters[0].Constants.RegisterSpace = 0;
@@ -1727,9 +1796,13 @@ bool EnsureRaymarchComputePipeline(std::string* error)
     rootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
     rootParameters[1].DescriptorTable.pDescriptorRanges = &uavRange;
     rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rootParameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rootParameters[2].Descriptor.ShaderRegister = 0;
+    rootParameters[2].Descriptor.RegisterSpace = 0;
+    rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-    rootDesc.NumParameters = 2;
+    rootDesc.NumParameters = 3;
     rootDesc.pParameters = rootParameters;
     rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -1895,21 +1968,18 @@ bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, const rock::SdfP
         SdfComputeConstants constants{};
         constants.resolution = clampedResolution;
         constants.primitiveKind = static_cast<UINT>(pipeline.primitiveKind);
-        constants.noiseOctaves = static_cast<UINT>(std::clamp(pipeline.noise.octaves, 1, 8));
-        constants.useNoise = pipeline.useNoise ? 1U : 0U;
-        constants.useCrack = pipeline.useCrack ? 1U : 0U;
-        constants.applyOutputIso = pipeline.applyOutputIso ? 1U : 0U;
-        constants.noiseAmplitude = pipeline.noise.amplitude;
-        constants.noiseFrequency = pipeline.noise.frequency;
-        constants.crackWidth = pipeline.crack.width;
-        constants.crackDepth = pipeline.crack.depth;
-        constants.crackRoughness = pipeline.crack.roughness;
-        constants.isoValue = pipeline.outputIsoValue;
+        const std::vector<GpuSdfOperation> operations = BuildGpuSdfOperations(pipeline);
+        constants.sdfOperationCount = static_cast<UINT>(operations.size());
+        const ComPtr<ID3D12Resource> operationBuffer = CreateUploadBuffer(
+            operations.data(),
+            static_cast<UINT64>(operations.size() * sizeof(GpuSdfOperation)),
+            "Create SDF operation buffer failed");
 
         commandList->SetComputeRootSignature(g_sdfComputeRootSignature.Get());
         commandList->SetPipelineState(g_sdfComputePipelineState.Get());
         commandList->SetComputeRoot32BitConstants(0, sizeof(SdfComputeConstants) / sizeof(UINT), &constants, 0);
         commandList->SetComputeRootUnorderedAccessView(1, outputBuffer->GetGPUVirtualAddress());
+        commandList->SetComputeRootShaderResourceView(2, operationBuffer->GetGPUVirtualAddress());
         const UINT groups = (clampedResolution + 7) / 8;
         commandList->Dispatch(groups, groups, groups);
 
@@ -2575,16 +2645,12 @@ bool RenderGpuRaymarchPreview(const ImVec2& min, const ImVec2& max, std::string*
         constants.height = static_cast<UINT>(targetHeight);
         const rock::SdfPipeline pipeline = g_graph.PreviewPipeline();
         constants.primitiveKind = static_cast<UINT>(pipeline.primitiveKind);
-        constants.noiseOctaves = static_cast<UINT>(std::clamp(pipeline.noise.octaves, 1, 8));
-        constants.useNoise = pipeline.useNoise ? 1U : 0U;
-        constants.useCrack = pipeline.useCrack ? 1U : 0U;
-        constants.applyOutputIso = pipeline.applyOutputIso ? 1U : 0U;
-        constants.noiseAmplitude = pipeline.noise.amplitude;
-        constants.noiseFrequency = pipeline.noise.frequency;
-        constants.crackWidth = pipeline.crack.width;
-        constants.crackDepth = pipeline.crack.depth;
-        constants.crackRoughness = pipeline.crack.roughness;
-        constants.isoValue = pipeline.outputIsoValue;
+        const std::vector<GpuSdfOperation> operations = BuildGpuSdfOperations(pipeline);
+        constants.sdfOperationCount = static_cast<UINT>(operations.size());
+        const ComPtr<ID3D12Resource> operationBuffer = CreateUploadBuffer(
+            operations.data(),
+            static_cast<UINT64>(operations.size() * sizeof(GpuSdfOperation)),
+            "Create raymarch operation buffer failed");
         constants.cameraPosition[0] = basis.position.x;
         constants.cameraPosition[1] = basis.position.y;
         constants.cameraPosition[2] = basis.position.z;
@@ -2612,6 +2678,7 @@ bool RenderGpuRaymarchPreview(const ImVec2& min, const ImVec2& max, std::string*
         commandList->SetPipelineState(g_raymarchComputePipelineState.Get());
         commandList->SetComputeRoot32BitConstants(0, sizeof(RaymarchComputeConstants) / sizeof(UINT), &constants, 0);
         commandList->SetComputeRootDescriptorTable(1, g_gpuRaymarchPreview.uavGpu);
+        commandList->SetComputeRootShaderResourceView(2, operationBuffer->GetGPUVirtualAddress());
         commandList->Dispatch((static_cast<UINT>(targetWidth) + 7) / 8, (static_cast<UINT>(targetHeight) + 7) / 8, 1);
 
         D3D12_RESOURCE_BARRIER toSrv{};
@@ -4043,6 +4110,10 @@ void DrawPropertiesPanel()
         {
             EvaluateGraph();
         }
+        if (DrawPropertyIntRow("Seed", "NoiseSeed", &editableNode->noise.seed, 0, 999999, rock::NoiseSettings{}.seed, "Noise seed changed"))
+        {
+            EvaluateGraph();
+        }
 
         ImGui::EndTable();
         return;
@@ -4443,11 +4514,13 @@ void DrawUi()
     }
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 8.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 7.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 6.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(10.0f, 6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 9.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(10.0f, 7.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
     if (ImGui::BeginMenuBar())
     {
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 5.0f);
         if (ImGui::BeginMenu("ファイル"))
         {
             if (ImGui::MenuItem("新規", "Ctrl+N"))
@@ -4648,7 +4721,7 @@ void DrawUi()
         }
         ImGui::EndMenuBar();
     }
-    ImGui::PopStyleVar(4);
+    ImGui::PopStyleVar(5);
 
     const ImVec2 content = ImGui::GetContentRegionAvail();
     const float statusBarHeight = ImGui::GetTextLineHeight() + 16.0f;

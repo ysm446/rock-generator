@@ -138,7 +138,17 @@ float PrimitiveSdf(Vec3 p, PrimitiveKind kind)
 
 float ApplyNoise(float sdf, Vec3 p, const NoiseSettings& noise)
 {
-    const float n = Fbm({p.x * noise.frequency, p.y * noise.frequency, p.z * noise.frequency}, noise.octaves);
+    const float seed = static_cast<float>(std::clamp(noise.seed, 0, 999999));
+    const Vec3 offset{
+        seed * 12.9898f,
+        seed * 78.233f,
+        seed * 37.719f,
+    };
+    const float n = Fbm({
+        p.x * noise.frequency + offset.x,
+        p.y * noise.frequency + offset.y,
+        p.z * noise.frequency + offset.z,
+    }, noise.octaves);
     return sdf + n * noise.amplitude * 0.12f;
 }
 
@@ -167,17 +177,42 @@ float EvaluatePipelineSdf(Vec3 p, const GraphSettings& settings, const SdfPipeli
     (void)settings;
     float sdf = PrimitiveSdf(p, pipeline.primitiveKind);
 
-    if (pipeline.useNoise)
+    if (!pipeline.operations.empty())
+    {
+        for (const SdfPipeline::Operation& operation : pipeline.operations)
+        {
+            switch (operation.kind)
+            {
+            case SdfPipeline::OperationKind::NoiseWarp:
+                sdf = ApplyNoise(sdf, p, operation.noise);
+                break;
+            case SdfPipeline::OperationKind::CrackField:
+                sdf = ApplyCracks(sdf, p, operation.crack);
+                break;
+            case SdfPipeline::OperationKind::OutputIso:
+                sdf -= operation.isoValue;
+                break;
+            }
+        }
+    }
+    else if (!pipeline.noiseLayers.empty())
+    {
+        for (const NoiseSettings& noise : pipeline.noiseLayers)
+        {
+            sdf = ApplyNoise(sdf, p, noise);
+        }
+    }
+    else if (pipeline.useNoise)
     {
         sdf = ApplyNoise(sdf, p, pipeline.noise);
     }
 
-    if (pipeline.useCrack)
+    if (pipeline.operations.empty() && pipeline.useCrack)
     {
         sdf = ApplyCracks(sdf, p, pipeline.crack);
     }
 
-    if (pipeline.applyOutputIso)
+    if (pipeline.operations.empty() && pipeline.applyOutputIso)
     {
         sdf -= pipeline.outputIsoValue;
     }
