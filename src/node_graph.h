@@ -186,6 +186,7 @@ public:
 
     bool CreateLink(GraphId startPin, GraphId endPin);
     bool DeleteLink(GraphId linkId);
+    void ReplaceLinks(std::vector<Link> links);
     bool SetPreviewStage(PreviewStage stage);
     PreviewStage Preview() const;
     void MarkDirty(std::string_view reason);

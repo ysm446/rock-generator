@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(RockGenerator VERSION 0.4.0 LANGUAGES CXX)
+project(RockGenerator VERSION 0.4.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,6 +31,7 @@ target_link_libraries(rock_generator PRIVATE
     d3d12
     dxgi
     d3dcompiler
+    comdlg32
 )
 
 target_include_directories(rock_generator PRIVATE

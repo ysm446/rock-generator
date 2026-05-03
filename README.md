@@ -23,11 +23,14 @@ Windows desktop prototype for a node-based SDF rock generation tool.
 - Viewport point-cloud preview sampled near the SDF zero surface
 - Debug wire preview generated from SDF sign-change cells
 - Prototype triangle surface preview built from SDF sign-change quads
+- GPU SDF raymarch preview toggle in `表示 > SDF Raymarch Preview`, with CPU fallback
 - Debug OBJ export to `exports/rock_debug.obj`
 - Interactive viewport orbit, pan, zoom, and reset controls
 - Node-stage preview: selecting graph nodes shows that generation stage in the viewport
 - JSON-driven UI themes in `data/ui_themes`, selectable from `設定 > UIテーマ`
 - Preview compute backend selection for CPU / GPU Preview / Auto; GPU preview uses D3D12 compute for the preview SDF values while final output remains CPU-based.
+- JSON project save/load via `ファイル > 保存` / `ファイル > 開く` using `.rockproj` files.
+- App settings persistence in `data/app_settings.json` for UI theme, preview compute backend, viewport camera state, preview visibility, and up to 8 recent project files.
 
 OpenVDB, real SDF evaluation, mesh extraction, and export nodes are intentionally left for later phases.
 

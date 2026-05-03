@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <commdlg.h>
 
 #include <algorithm>
 #include <array>
@@ -7,6 +8,8 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,6 +24,7 @@
 #include <imgui_impl_dx12.h>
 #include <imgui_impl_win32.h>
 #include <imgui-node-editor/imgui_node_editor.h>
+#include <nlohmann/json.hpp>
 
 #include "node_graph.h"
 #include "obj_exporter.h"
@@ -63,6 +67,8 @@ UINT g_rtvDescriptorSize = 0;
 UINT g_srvDescriptorSize = 0;
 ComPtr<ID3D12RootSignature> g_sdfComputeRootSignature;
 ComPtr<ID3D12PipelineState> g_sdfComputePipelineState;
+ComPtr<ID3D12RootSignature> g_raymarchComputeRootSignature;
+ComPtr<ID3D12PipelineState> g_raymarchComputePipelineState;
 
 std::array<FrameContext, kFrameCount> g_frameContexts;
 std::array<ComPtr<ID3D12Resource>, kFrameCount> g_renderTargets;
@@ -71,6 +77,9 @@ ed::EditorContext* g_nodeEditor = nullptr;
 bool g_nodePositionsInitialized = false;
 rock::NodeGraph g_graph = rock::NodeGraph::CreateDefaultRockGraph();
 std::string g_exportStatus = "No export yet";
+std::string g_projectStatus = "No project file";
+std::filesystem::path g_projectPath;
+std::vector<std::filesystem::path> g_recentProjectPaths;
 rock::UiThemeManager g_themeManager;
 rock::GraphId g_selectedNodeId = 0;
 
@@ -122,6 +131,47 @@ struct ProjectedPoint
     float depth = 0.0f;
 };
 
+struct RaymarchPreviewCache
+{
+    int width = 0;
+    int height = 0;
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float fovDegrees = 0.0f;
+    float orbitDistance = 0.0f;
+    float zoom = 0.0f;
+    ImVec2 pan = ImVec2(0.0f, 0.0f);
+    uint64_t graphVersion = 0;
+    rock::PreviewStage previewStage = rock::PreviewStage::Output;
+    std::vector<ImU32> pixels;
+};
+
+struct GpuRaymarchPreview
+{
+    int width = 0;
+    int height = 0;
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float fovDegrees = 0.0f;
+    float orbitDistance = 0.0f;
+    float zoom = 0.0f;
+    ImVec2 pan = ImVec2(0.0f, 0.0f);
+    uint64_t graphVersion = 0;
+    rock::PreviewStage previewStage = rock::PreviewStage::Output;
+    ComPtr<ID3D12Resource> texture;
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu{};
+    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu{};
+    D3D12_CPU_DESCRIPTOR_HANDLE uavCpu{};
+    D3D12_GPU_DESCRIPTOR_HANDLE uavGpu{};
+    bool srvAllocated = false;
+    bool uavAllocated = false;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    std::string status;
+};
+
+RaymarchPreviewCache g_raymarchPreviewCache;
+GpuRaymarchPreview g_gpuRaymarchPreview;
+
 struct SdfComputeConstants
 {
     UINT resolution = 48;
@@ -136,6 +186,31 @@ struct SdfComputeConstants
     float padding0 = 0.0f;
     float padding1 = 0.0f;
     float padding2 = 0.0f;
+};
+
+struct RaymarchComputeConstants
+{
+    UINT width = 0;
+    UINT height = 0;
+    UINT primitiveKind = 0;
+    UINT previewStage = 0;
+    UINT noiseOctaves = 4;
+    float noiseAmplitude = 0.0f;
+    float noiseFrequency = 1.0f;
+    float crackWidth = 0.0f;
+    float crackDepth = 0.0f;
+    float crackRoughness = 0.0f;
+    float preCameraPadding[2]{};
+    float cameraPosition[4]{};
+    float cameraRight[4]{};
+    float cameraUp[4]{};
+    float cameraForward[4]{};
+    float viewportMin[2]{};
+    float viewportMax[2]{};
+    float viewportCenter[2]{};
+    float focalLength = 1.0f;
+    float projectionScale = 1.0f;
+    float padding[2]{};
 };
 
 std::wstring MakeWindowTitle()
@@ -180,6 +255,23 @@ D3D12_RESOURCE_DESC BufferResourceDesc(UINT64 byteSize, D3D12_RESOURCE_FLAGS fla
     desc.SampleDesc.Count = 1;
     desc.SampleDesc.Quality = 0;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = flags;
+    return desc;
+}
+
+D3D12_RESOURCE_DESC Texture2DResourceDesc(UINT width, UINT height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE)
+{
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Alignment = 0;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.Flags = flags;
     return desc;
 }
@@ -385,6 +477,19 @@ void CleanupD3D()
     CleanupRenderTarget();
     g_sdfComputePipelineState.Reset();
     g_sdfComputeRootSignature.Reset();
+    g_raymarchComputePipelineState.Reset();
+    g_raymarchComputeRootSignature.Reset();
+    if (g_gpuRaymarchPreview.srvAllocated)
+    {
+        FreeSrvDescriptor(nullptr, g_gpuRaymarchPreview.srvCpu, g_gpuRaymarchPreview.srvGpu);
+        g_gpuRaymarchPreview.srvAllocated = false;
+    }
+    if (g_gpuRaymarchPreview.uavAllocated)
+    {
+        FreeSrvDescriptor(nullptr, g_gpuRaymarchPreview.uavCpu, g_gpuRaymarchPreview.uavGpu);
+        g_gpuRaymarchPreview.uavAllocated = false;
+    }
+    g_gpuRaymarchPreview.texture.Reset();
     if (g_fenceEvent)
     {
         CloseHandle(g_fenceEvent);
@@ -392,21 +497,443 @@ void CleanupD3D()
     }
 }
 
-std::filesystem::path SdfPreviewShaderPath()
+std::filesystem::path ShaderPath(const char* fileName)
 {
-    const std::filesystem::path cwdPath = std::filesystem::path("shaders") / "sdf_preview_cs.hlsl";
+    const std::filesystem::path cwdPath = std::filesystem::path("shaders") / fileName;
     if (std::filesystem::exists(cwdPath))
     {
         return cwdPath;
     }
 
-    const std::filesystem::path modulePath = std::filesystem::path(ModuleDirectory()) / "shaders" / "sdf_preview_cs.hlsl";
+    const std::filesystem::path modulePath = std::filesystem::path(ModuleDirectory()) / "shaders" / fileName;
     if (std::filesystem::exists(modulePath))
     {
         return modulePath;
     }
 
     return cwdPath;
+}
+
+std::filesystem::path SdfPreviewShaderPath()
+{
+    return ShaderPath("sdf_preview_cs.hlsl");
+}
+
+std::filesystem::path RaymarchPreviewShaderPath()
+{
+    return ShaderPath("raymarch_preview_cs.hlsl");
+}
+
+void EvaluateGraph();
+
+std::optional<std::filesystem::path> ShowProjectFileDialog(bool save)
+{
+    wchar_t fileName[MAX_PATH]{};
+    if (!g_projectPath.empty())
+    {
+        const std::wstring current = g_projectPath.wstring();
+        wcsncpy_s(fileName, current.c_str(), _TRUNCATE);
+    }
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFilter = L"Rock Generator Project (*.rockproj)\0*.rockproj\0JSON (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = fileName;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"rockproj";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (save)
+    {
+        ofn.Flags |= OFN_OVERWRITEPROMPT;
+        if (!GetSaveFileNameW(&ofn))
+        {
+            return std::nullopt;
+        }
+    }
+    else
+    {
+        ofn.Flags |= OFN_FILEMUSTEXIST;
+        if (!GetOpenFileNameW(&ofn))
+        {
+            return std::nullopt;
+        }
+    }
+
+    return std::filesystem::path(fileName);
+}
+
+std::string PathToUtf8(const std::filesystem::path& path)
+{
+    const std::u8string value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
+
+std::filesystem::path PathFromUtf8(const std::string& value)
+{
+    const std::u8string utf8(value.begin(), value.end());
+    return std::filesystem::path(utf8);
+}
+
+std::filesystem::path NormalizedProjectPath(const std::filesystem::path& path)
+{
+    return std::filesystem::absolute(path).lexically_normal();
+}
+
+void AddRecentProjectPath(const std::filesystem::path& path)
+{
+    constexpr size_t kMaxRecentProjects = 8;
+    const std::filesystem::path normalized = NormalizedProjectPath(path);
+    const auto existing = std::remove_if(g_recentProjectPaths.begin(), g_recentProjectPaths.end(), [&](const std::filesystem::path& recentPath) {
+        return NormalizedProjectPath(recentPath) == normalized;
+    });
+    g_recentProjectPaths.erase(existing, g_recentProjectPaths.end());
+    g_recentProjectPaths.insert(g_recentProjectPaths.begin(), normalized);
+    if (g_recentProjectPaths.size() > kMaxRecentProjects)
+    {
+        g_recentProjectPaths.resize(kMaxRecentProjects);
+    }
+}
+
+std::filesystem::path DataDirectory()
+{
+    const std::filesystem::path cwdData = std::filesystem::path("data");
+    if (std::filesystem::exists(cwdData))
+    {
+        return cwdData;
+    }
+
+    const std::filesystem::path moduleData = std::filesystem::path(ModuleDirectory()) / "data";
+    if (std::filesystem::exists(moduleData))
+    {
+        return moduleData;
+    }
+
+    return cwdData;
+}
+
+std::filesystem::path AppSettingsPath()
+{
+    return DataDirectory() / "app_settings.json";
+}
+
+bool SaveAppSettings(std::string* error = nullptr)
+{
+    try
+    {
+        const rock::GraphSettings& settings = g_graph.Settings();
+        nlohmann::json root;
+        root["format"] = "rock_generator_app_settings";
+        root["formatVersion"] = 1;
+        root["appVersion"] = ROCK_GENERATOR_VERSION_STRING;
+        root["uiTheme"] = g_themeManager.CurrentThemeId();
+        root["previewBackend"] = static_cast<int>(settings.previewBackend);
+        root["previewVisibility"] = {
+            {"mesh", g_ui.meshPreview},
+            {"raymarch", g_ui.sdfPreview},
+        };
+        root["recentProjects"] = nlohmann::json::array();
+        for (const std::filesystem::path& recentPath : g_recentProjectPaths)
+        {
+            root["recentProjects"].push_back(PathToUtf8(recentPath));
+        }
+        root["viewport"] = {
+            {"yaw", g_viewport.yaw},
+            {"pitch", g_viewport.pitch},
+            {"fovDegrees", g_viewport.fovDegrees},
+            {"orbitDistance", g_viewport.orbitDistance},
+            {"zoom", g_viewport.zoom},
+            {"pan", {g_viewport.pan.x, g_viewport.pan.y}},
+        };
+
+        const std::filesystem::path path = AppSettingsPath();
+        if (path.has_parent_path())
+        {
+            std::filesystem::create_directories(path.parent_path());
+        }
+
+        std::ofstream stream(path);
+        if (!stream)
+        {
+            if (error) *error = "Failed to open app settings for writing";
+            return false;
+        }
+        stream << root.dump(2);
+        return true;
+    }
+    catch (const std::exception& ex)
+    {
+        if (error) *error = ex.what();
+        return false;
+    }
+}
+
+void SaveAppSettingsSilently()
+{
+    std::string error;
+    if (!SaveAppSettings(&error))
+    {
+        g_projectStatus = "App settings save failed: " + error;
+    }
+}
+
+bool LoadAppSettings(std::string* error = nullptr)
+{
+    try
+    {
+        const std::filesystem::path path = AppSettingsPath();
+        if (!std::filesystem::exists(path))
+        {
+            return false;
+        }
+
+        std::ifstream stream(path);
+        if (!stream)
+        {
+            if (error) *error = "Failed to open app settings for reading";
+            return false;
+        }
+
+        nlohmann::json root;
+        stream >> root;
+        if (root.value("format", std::string()) != "rock_generator_app_settings")
+        {
+            if (error) *error = "Unsupported app settings format";
+            return false;
+        }
+
+        const std::string themeId = root.value("uiTheme", std::string());
+        if (!themeId.empty())
+        {
+            g_themeManager.ApplyTheme(themeId);
+        }
+
+        rock::GraphSettings& settings = g_graph.Settings();
+        settings.previewBackend = static_cast<rock::ComputeBackend>(std::clamp(root.value("previewBackend", static_cast<int>(settings.previewBackend)), 0, 2));
+
+        const nlohmann::json visibilityJson = root.value("previewVisibility", nlohmann::json::object());
+        g_ui.meshPreview = visibilityJson.value("mesh", g_ui.meshPreview);
+        g_ui.sdfPreview = visibilityJson.value("raymarch", g_ui.sdfPreview);
+
+        g_recentProjectPaths.clear();
+        if (root.contains("recentProjects") && root["recentProjects"].is_array())
+        {
+            for (const nlohmann::json& recentJson : root["recentProjects"])
+            {
+                if (!recentJson.is_string())
+                {
+                    continue;
+                }
+                AddRecentProjectPath(PathFromUtf8(recentJson.get<std::string>()));
+            }
+        }
+
+        const nlohmann::json viewportJson = root.value("viewport", nlohmann::json::object());
+        g_viewport.yaw = viewportJson.value("yaw", g_viewport.yaw);
+        g_viewport.pitch = std::clamp(viewportJson.value("pitch", g_viewport.pitch), -1.25f, 1.25f);
+        g_viewport.fovDegrees = std::clamp(viewportJson.value("fovDegrees", g_viewport.fovDegrees), 15.0f, 90.0f);
+        g_viewport.orbitDistance = std::clamp(viewportJson.value("orbitDistance", g_viewport.orbitDistance), 1.0f, 40.0f);
+        g_viewport.zoom = std::clamp(viewportJson.value("zoom", g_viewport.zoom), 0.35f, 4.0f);
+        if (viewportJson.contains("pan") && viewportJson["pan"].is_array() && viewportJson["pan"].size() == 2)
+        {
+            g_viewport.pan = ImVec2(viewportJson["pan"][0].get<float>(), viewportJson["pan"][1].get<float>());
+        }
+
+        g_projectStatus = "Loaded app settings " + PathToUtf8(path);
+        return true;
+    }
+    catch (const std::exception& ex)
+    {
+        if (error) *error = ex.what();
+        return false;
+    }
+}
+
+bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
+{
+    try
+    {
+        const rock::GraphSettings& settings = g_graph.Settings();
+        nlohmann::json root;
+        root["format"] = "rock_generator_project";
+        root["formatVersion"] = 1;
+        root["appVersion"] = ROCK_GENERATOR_VERSION_STRING;
+        root["theme"] = g_themeManager.CurrentThemeId();
+        root["selectedNodeId"] = g_selectedNodeId;
+        root["previewStage"] = static_cast<int>(g_graph.Preview());
+
+        root["settings"] = {
+            {"primitive", {{"kind", static_cast<int>(settings.primitive.kind)}}},
+            {"noise", {
+                {"amplitude", settings.noise.amplitude},
+                {"frequency", settings.noise.frequency},
+                {"octaves", settings.noise.octaves},
+            }},
+            {"crack", {
+                {"width", settings.crack.width},
+                {"depth", settings.crack.depth},
+                {"roughness", settings.crack.roughness},
+            }},
+            {"previewBackend", static_cast<int>(settings.previewBackend)},
+        };
+
+        root["viewport"] = {
+            {"yaw", g_viewport.yaw},
+            {"pitch", g_viewport.pitch},
+            {"fovDegrees", g_viewport.fovDegrees},
+            {"orbitDistance", g_viewport.orbitDistance},
+            {"zoom", g_viewport.zoom},
+            {"pan", {g_viewport.pan.x, g_viewport.pan.y}},
+        };
+
+        root["links"] = nlohmann::json::array();
+        for (const rock::Link& link : g_graph.Links())
+        {
+            root["links"].push_back({
+                {"id", link.id},
+                {"startPin", link.startPin},
+                {"endPin", link.endPin},
+            });
+        }
+
+        root["nodePositions"] = nlohmann::json::object();
+        if (g_nodeEditor != nullptr)
+        {
+            ed::SetCurrentEditor(g_nodeEditor);
+            for (const rock::Node& node : g_graph.Nodes())
+            {
+                const ImVec2 position = ed::GetNodePosition(ed::NodeId(node.id));
+                root["nodePositions"][std::to_string(node.id)] = {position.x, position.y};
+            }
+            ed::SetCurrentEditor(nullptr);
+        }
+
+        if (path.has_parent_path())
+        {
+            std::filesystem::create_directories(path.parent_path());
+        }
+        std::ofstream stream(path);
+        if (!stream)
+        {
+            if (error) *error = "Failed to open project for writing";
+            return false;
+        }
+        stream << root.dump(2);
+        g_projectPath = path;
+        AddRecentProjectPath(path);
+        SaveAppSettingsSilently();
+        g_projectStatus = "Saved " + PathToUtf8(path);
+        return true;
+    }
+    catch (const std::exception& ex)
+    {
+        if (error) *error = ex.what();
+        return false;
+    }
+}
+
+bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
+{
+    try
+    {
+        std::ifstream stream(path);
+        if (!stream)
+        {
+            if (error) *error = "Failed to open project for reading";
+            return false;
+        }
+
+        nlohmann::json root;
+        stream >> root;
+        if (root.value("format", std::string()) != "rock_generator_project")
+        {
+            if (error) *error = "Unsupported project format";
+            return false;
+        }
+
+        rock::GraphSettings& settings = g_graph.Settings();
+        const nlohmann::json settingsJson = root.value("settings", nlohmann::json::object());
+        const nlohmann::json primitiveJson = settingsJson.value("primitive", nlohmann::json::object());
+        const nlohmann::json noiseJson = settingsJson.value("noise", nlohmann::json::object());
+        const nlohmann::json crackJson = settingsJson.value("crack", nlohmann::json::object());
+        settings.primitive.kind = static_cast<rock::PrimitiveKind>(std::clamp(primitiveJson.value("kind", static_cast<int>(settings.primitive.kind)), 0, 4));
+        settings.noise.amplitude = noiseJson.value("amplitude", settings.noise.amplitude);
+        settings.noise.frequency = noiseJson.value("frequency", settings.noise.frequency);
+        settings.noise.octaves = std::clamp(noiseJson.value("octaves", settings.noise.octaves), 1, 8);
+        settings.crack.width = crackJson.value("width", settings.crack.width);
+        settings.crack.depth = crackJson.value("depth", settings.crack.depth);
+        settings.crack.roughness = crackJson.value("roughness", settings.crack.roughness);
+        settings.previewBackend = static_cast<rock::ComputeBackend>(std::clamp(settingsJson.value("previewBackend", static_cast<int>(settings.previewBackend)), 0, 2));
+
+        const nlohmann::json viewportJson = root.value("viewport", nlohmann::json::object());
+        g_viewport.yaw = viewportJson.value("yaw", g_viewport.yaw);
+        g_viewport.pitch = viewportJson.value("pitch", g_viewport.pitch);
+        g_viewport.fovDegrees = viewportJson.value("fovDegrees", g_viewport.fovDegrees);
+        g_viewport.orbitDistance = viewportJson.value("orbitDistance", g_viewport.orbitDistance);
+        g_viewport.zoom = viewportJson.value("zoom", g_viewport.zoom);
+        if (viewportJson.contains("pan") && viewportJson["pan"].is_array() && viewportJson["pan"].size() == 2)
+        {
+            g_viewport.pan = ImVec2(viewportJson["pan"][0].get<float>(), viewportJson["pan"][1].get<float>());
+        }
+
+        std::vector<rock::Link> links;
+        if (root.contains("links") && root["links"].is_array())
+        {
+            for (const nlohmann::json& linkJson : root["links"])
+            {
+                rock::Link link;
+                link.id = linkJson.value("id", 0);
+                link.startPin = linkJson.value("startPin", 0);
+                link.endPin = linkJson.value("endPin", 0);
+                if (link.id > 0 && g_graph.CanCreateLink(link.startPin, link.endPin))
+                {
+                    links.push_back(link);
+                }
+            }
+        }
+        g_graph.ReplaceLinks(std::move(links));
+        g_selectedNodeId = root.value("selectedNodeId", 0);
+        g_graph.SetPreviewStage(static_cast<rock::PreviewStage>(std::clamp(root.value("previewStage", static_cast<int>(g_graph.Preview())), 0, 3)));
+
+        if (g_nodeEditor != nullptr && root.contains("nodePositions") && root["nodePositions"].is_object())
+        {
+            ed::SetCurrentEditor(g_nodeEditor);
+            for (const rock::Node& node : g_graph.Nodes())
+            {
+                const std::string key = std::to_string(node.id);
+                if (!root["nodePositions"].contains(key))
+                {
+                    continue;
+                }
+
+                const nlohmann::json& positionJson = root["nodePositions"][key];
+                if (positionJson.is_array() && positionJson.size() == 2)
+                {
+                    ed::SetNodePosition(ed::NodeId(node.id), ImVec2(positionJson[0].get<float>(), positionJson[1].get<float>()));
+                }
+            }
+            ed::SetCurrentEditor(nullptr);
+            g_nodePositionsInitialized = true;
+        }
+
+        const std::string themeId = root.value("theme", std::string());
+        if (!themeId.empty())
+        {
+            g_themeManager.ApplyTheme(themeId);
+        }
+
+        g_projectPath = path;
+        AddRecentProjectPath(path);
+        SaveAppSettingsSilently();
+        g_projectStatus = "Loaded " + PathToUtf8(path);
+        EvaluateGraph();
+        return true;
+    }
+    catch (const std::exception& ex)
+    {
+        if (error) *error = ex.what();
+        return false;
+    }
 }
 
 bool EnsureSdfComputePipeline(std::string* error)
@@ -482,6 +1009,92 @@ bool EnsureSdfComputePipeline(std::string* error)
     if (FAILED(hr))
     {
         if (error) *error = "CreateComputePipelineState failed";
+        return false;
+    }
+
+    return true;
+}
+
+bool EnsureRaymarchComputePipeline(std::string* error)
+{
+    if (g_raymarchComputeRootSignature && g_raymarchComputePipelineState)
+    {
+        return true;
+    }
+
+    if (!g_device)
+    {
+        if (error) *error = "D3D12 device is not initialized";
+        return false;
+    }
+
+    D3D12_DESCRIPTOR_RANGE uavRange{};
+    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uavRange.NumDescriptors = 1;
+    uavRange.BaseShaderRegister = 0;
+    uavRange.RegisterSpace = 0;
+    uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER rootParameters[2]{};
+    rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParameters[0].Constants.ShaderRegister = 0;
+    rootParameters[0].Constants.RegisterSpace = 0;
+    rootParameters[0].Constants.Num32BitValues = sizeof(RaymarchComputeConstants) / sizeof(UINT);
+    rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    rootParameters[1].DescriptorTable.pDescriptorRanges = &uavRange;
+    rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+    rootDesc.NumParameters = 2;
+    rootDesc.pParameters = rootParameters;
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> signatureBlob;
+    ComPtr<ID3DBlob> errorBlob;
+    HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signatureBlob, &errorBlob);
+    if (FAILED(hr))
+    {
+        if (error)
+        {
+            *error = errorBlob ? static_cast<const char*>(errorBlob->GetBufferPointer()) : "D3D12SerializeRootSignature failed";
+        }
+        return false;
+    }
+
+    hr = g_device->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(), IID_PPV_ARGS(&g_raymarchComputeRootSignature));
+    if (FAILED(hr))
+    {
+        if (error) *error = "Create raymarch root signature failed";
+        return false;
+    }
+
+    const std::filesystem::path shaderPath = RaymarchPreviewShaderPath();
+    ComPtr<ID3DBlob> shaderBlob;
+    errorBlob.Reset();
+    UINT compileFlags = D3DCOMPILE_ENABLE_STRICTNESS;
+#if defined(_DEBUG)
+    compileFlags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+    hr = D3DCompileFromFile(shaderPath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_0", compileFlags, 0, &shaderBlob, &errorBlob);
+    if (FAILED(hr))
+    {
+        if (error)
+        {
+            *error = errorBlob ? static_cast<const char*>(errorBlob->GetBufferPointer()) : "D3DCompileFromFile failed";
+        }
+        return false;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = g_raymarchComputeRootSignature.Get();
+    psoDesc.CS.pShaderBytecode = shaderBlob->GetBufferPointer();
+    psoDesc.CS.BytecodeLength = shaderBlob->GetBufferSize();
+    hr = g_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&g_raymarchComputePipelineState));
+    if (FAILED(hr))
+    {
+        if (error) *error = "Create raymarch compute pipeline failed";
         return false;
     }
 
@@ -637,6 +1250,11 @@ Vec3 Subtract(Vec3 a, Vec3 b)
     return Vec3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
 
+Vec3 Add(Vec3 a, Vec3 b)
+{
+    return Vec3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
 Vec3 Scale(Vec3 value, float scalar)
 {
     return Vec3(value.x * scalar, value.y * scalar, value.z * scalar);
@@ -645,6 +1263,11 @@ Vec3 Scale(Vec3 value, float scalar)
 float Dot(Vec3 a, Vec3 b)
 {
     return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+float Length(Vec3 value)
+{
+    return std::sqrt(Dot(value, value));
 }
 
 Vec3 Cross(Vec3 a, Vec3 b)
@@ -764,6 +1387,361 @@ void DrawSdfSliceOverlay(ImDrawList* drawList, const ImVec2& min, const ImVec2& 
     }
 
     drawList->AddRect(panelMin, panelMax, ThemeColor("viewportGrid", ImVec4(0.56f, 0.59f, 0.57f, 1.0f)), 0.0f, 0, 1.0f);
+}
+
+bool IntersectUnitBounds(Vec3 origin, Vec3 direction, float& nearT, float& farT)
+{
+    nearT = 0.0f;
+    farT = 1000.0f;
+    const float originValues[3] = {origin.x, origin.y, origin.z};
+    const float directionValues[3] = {direction.x, direction.y, direction.z};
+
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        const float rayOrigin = originValues[axis];
+        const float rayDirection = directionValues[axis];
+        if (std::fabs(rayDirection) < 0.00001f)
+        {
+            if (rayOrigin < -1.05f || rayOrigin > 1.05f)
+            {
+                return false;
+            }
+            continue;
+        }
+
+        float t0 = (-1.05f - rayOrigin) / rayDirection;
+        float t1 = (1.05f - rayOrigin) / rayDirection;
+        if (t0 > t1)
+        {
+            std::swap(t0, t1);
+        }
+        nearT = std::max(nearT, t0);
+        farT = std::min(farT, t1);
+        if (nearT > farT)
+        {
+            return false;
+        }
+    }
+
+    return farT > 0.0f;
+}
+
+Vec3 EstimateSdfNormal(const rock::GraphSettings& settings, Vec3 p, rock::PreviewStage stage)
+{
+    constexpr float e = 0.012f;
+    const float dx = rock::EvaluateSdfAt(settings, p.x + e, p.y, p.z, stage) - rock::EvaluateSdfAt(settings, p.x - e, p.y, p.z, stage);
+    const float dy = rock::EvaluateSdfAt(settings, p.x, p.y + e, p.z, stage) - rock::EvaluateSdfAt(settings, p.x, p.y - e, p.z, stage);
+    const float dz = rock::EvaluateSdfAt(settings, p.x, p.y, p.z + e, stage) - rock::EvaluateSdfAt(settings, p.x, p.y, p.z - e, stage);
+    return Normalize(Vec3(dx, dy, dz), Vec3(0.0f, 1.0f, 0.0f));
+}
+
+ImU32 ShadeRaymarchHit(Vec3 point, Vec3 normal, Vec3 viewDirection, int steps)
+{
+    const Vec3 lightDirection = Normalize(Vec3(-0.45f, 0.78f, 0.42f), Vec3(0.0f, 1.0f, 0.0f));
+    const float diffuse = std::clamp(Dot(normal, lightDirection) * 0.5f + 0.5f, 0.0f, 1.0f);
+    const float fresnel = std::pow(std::clamp(1.0f - std::fabs(Dot(normal, Scale(viewDirection, -1.0f))), 0.0f, 1.0f), 2.0f);
+    const float height = std::clamp(point.y * 0.5f + 0.5f, 0.0f, 1.0f);
+    const float stepShade = std::clamp(1.0f - static_cast<float>(steps) / 64.0f, 0.0f, 1.0f);
+
+    const int r = static_cast<int>(95.0f + diffuse * 70.0f + fresnel * 36.0f + height * 14.0f);
+    const int g = static_cast<int>(104.0f + diffuse * 82.0f + fresnel * 28.0f + height * 12.0f);
+    const int b = static_cast<int>(94.0f + diffuse * 62.0f + fresnel * 20.0f + stepShade * 14.0f);
+    return IM_COL32(std::clamp(r, 0, 255), std::clamp(g, 0, 255), std::clamp(b, 0, 255), 235);
+}
+
+void RebuildRaymarchPreviewCache(const ImVec2& min, const ImVec2& max)
+{
+    const float viewportWidth = std::max(1.0f, max.x - min.x);
+    const float viewportHeight = std::max(1.0f, max.y - min.y);
+    g_raymarchPreviewCache.width = std::clamp(static_cast<int>(viewportWidth / 6.0f), 96, 180);
+    g_raymarchPreviewCache.height = std::clamp(static_cast<int>(viewportHeight / 6.0f), 72, 140);
+    g_raymarchPreviewCache.yaw = g_viewport.yaw;
+    g_raymarchPreviewCache.pitch = g_viewport.pitch;
+    g_raymarchPreviewCache.fovDegrees = g_viewport.fovDegrees;
+    g_raymarchPreviewCache.orbitDistance = g_viewport.orbitDistance;
+    g_raymarchPreviewCache.zoom = g_viewport.zoom;
+    g_raymarchPreviewCache.pan = g_viewport.pan;
+    g_raymarchPreviewCache.graphVersion = g_graph.Evaluation().version;
+    g_raymarchPreviewCache.previewStage = g_graph.Preview();
+    g_raymarchPreviewCache.pixels.assign(static_cast<size_t>(g_raymarchPreviewCache.width * g_raymarchPreviewCache.height), 0);
+
+    const CameraBasis basis = BuildCameraBasis();
+    const rock::GraphSettings& settings = g_graph.Settings();
+    const rock::PreviewStage stage = g_graph.Preview();
+    const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.5f + g_viewport.pan.y);
+    const float viewportSize = std::min(viewportWidth, viewportHeight);
+    const float projectionScale = viewportSize * 1.20f * g_viewport.zoom;
+    const float fovRadians = std::clamp(g_viewport.fovDegrees, 15.0f, 90.0f) * 3.1415926535f / 180.0f;
+    const float focalLength = 1.0f / std::tan(fovRadians * 0.5f);
+
+    for (int y = 0; y < g_raymarchPreviewCache.height; ++y)
+    {
+        for (int x = 0; x < g_raymarchPreviewCache.width; ++x)
+        {
+            const float screenX = std::lerp(min.x, max.x, (static_cast<float>(x) + 0.5f) / static_cast<float>(g_raymarchPreviewCache.width));
+            const float screenY = std::lerp(min.y, max.y, (static_cast<float>(y) + 0.5f) / static_cast<float>(g_raymarchPreviewCache.height));
+            const float cameraXOverDepth = (screenX - center.x) / std::max(focalLength * projectionScale, 0.001f);
+            const float cameraYOverDepth = -(screenY - center.y) / std::max(focalLength * projectionScale, 0.001f);
+            Vec3 direction = Add(basis.forward, Add(Scale(basis.right, cameraXOverDepth), Scale(basis.up, cameraYOverDepth)));
+            direction = Normalize(direction, basis.forward);
+
+            float nearT = 0.0f;
+            float farT = 0.0f;
+            if (!IntersectUnitBounds(basis.position, direction, nearT, farT))
+            {
+                continue;
+            }
+
+            float t = std::max(nearT, 0.0f);
+            int step = 0;
+            for (; step < 72 && t <= farT; ++step)
+            {
+                const Vec3 p = Add(basis.position, Scale(direction, t));
+                const float sdf = rock::EvaluateSdfAt(settings, p.x, p.y, p.z, stage);
+                if (std::fabs(sdf) < 0.0045f)
+                {
+                    const Vec3 normal = EstimateSdfNormal(settings, p, stage);
+                    g_raymarchPreviewCache.pixels[static_cast<size_t>(y * g_raymarchPreviewCache.width + x)] = ShadeRaymarchHit(p, normal, direction, step);
+                    break;
+                }
+                t += std::max(std::fabs(sdf) * 0.82f, 0.004f);
+            }
+        }
+    }
+}
+
+bool EnsureGpuRaymarchTexture(int width, int height, std::string* error)
+{
+    if (g_gpuRaymarchPreview.texture && g_gpuRaymarchPreview.width == width && g_gpuRaymarchPreview.height == height)
+    {
+        return true;
+    }
+
+    try
+    {
+        WaitForLastSubmittedFrame();
+        g_gpuRaymarchPreview.texture.Reset();
+        g_gpuRaymarchPreview.width = width;
+        g_gpuRaymarchPreview.height = height;
+        g_gpuRaymarchPreview.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+        if (!g_gpuRaymarchPreview.srvAllocated)
+        {
+            AllocateSrvDescriptor(nullptr, &g_gpuRaymarchPreview.srvCpu, &g_gpuRaymarchPreview.srvGpu);
+            g_gpuRaymarchPreview.srvAllocated = true;
+        }
+        if (!g_gpuRaymarchPreview.uavAllocated)
+        {
+            AllocateSrvDescriptor(nullptr, &g_gpuRaymarchPreview.uavCpu, &g_gpuRaymarchPreview.uavGpu);
+            g_gpuRaymarchPreview.uavAllocated = true;
+        }
+
+        const D3D12_HEAP_PROPERTIES defaultHeap = HeapProperties(D3D12_HEAP_TYPE_DEFAULT);
+        const D3D12_RESOURCE_DESC textureDesc = Texture2DResourceDesc(static_cast<UINT>(width), static_cast<UINT>(height), DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        ThrowIfFailed(g_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &textureDesc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g_gpuRaymarchPreview.texture)), "Create raymarch texture failed");
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MipLevels = 1;
+        g_device->CreateShaderResourceView(g_gpuRaymarchPreview.texture.Get(), &srvDesc, g_gpuRaymarchPreview.srvCpu);
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+        uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g_device->CreateUnorderedAccessView(g_gpuRaymarchPreview.texture.Get(), nullptr, &uavDesc, g_gpuRaymarchPreview.uavCpu);
+        return true;
+    }
+    catch (const std::exception& ex)
+    {
+        if (error) *error = ex.what();
+        return false;
+    }
+}
+
+bool RenderGpuRaymarchPreview(const ImVec2& min, const ImVec2& max, std::string* error)
+{
+    if (!EnsureRaymarchComputePipeline(error))
+    {
+        return false;
+    }
+
+    const float viewportWidth = std::max(1.0f, max.x - min.x);
+    const float viewportHeight = std::max(1.0f, max.y - min.y);
+    const int targetWidth = std::clamp(static_cast<int>(viewportWidth), 160, 960);
+    const int targetHeight = std::clamp(static_cast<int>(viewportHeight), 120, 720);
+    if (!EnsureGpuRaymarchTexture(targetWidth, targetHeight, error))
+    {
+        return false;
+    }
+
+    const bool dirty =
+        g_gpuRaymarchPreview.yaw != g_viewport.yaw ||
+        g_gpuRaymarchPreview.pitch != g_viewport.pitch ||
+        g_gpuRaymarchPreview.fovDegrees != g_viewport.fovDegrees ||
+        g_gpuRaymarchPreview.orbitDistance != g_viewport.orbitDistance ||
+        g_gpuRaymarchPreview.zoom != g_viewport.zoom ||
+        g_gpuRaymarchPreview.pan.x != g_viewport.pan.x ||
+        g_gpuRaymarchPreview.pan.y != g_viewport.pan.y ||
+        g_gpuRaymarchPreview.graphVersion != g_graph.Evaluation().version ||
+        g_gpuRaymarchPreview.previewStage != g_graph.Preview() ||
+        g_gpuRaymarchPreview.state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (!dirty)
+    {
+        return true;
+    }
+
+    try
+    {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12GraphicsCommandList> commandList;
+        ThrowIfFailed(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "Create raymarch allocator failed");
+        ThrowIfFailed(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commandList)), "Create raymarch command list failed");
+
+        if (g_gpuRaymarchPreview.state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        {
+            D3D12_RESOURCE_BARRIER toUav{};
+            toUav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toUav.Transition.pResource = g_gpuRaymarchPreview.texture.Get();
+            toUav.Transition.StateBefore = g_gpuRaymarchPreview.state;
+            toUav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            toUav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            commandList->ResourceBarrier(1, &toUav);
+        }
+
+        const CameraBasis basis = BuildCameraBasis();
+        const rock::GraphSettings& settings = g_graph.Settings();
+        const float viewportSize = std::min(viewportWidth, viewportHeight);
+        const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.5f + g_viewport.pan.y);
+        const float fovRadians = std::clamp(g_viewport.fovDegrees, 15.0f, 90.0f) * 3.1415926535f / 180.0f;
+
+        RaymarchComputeConstants constants{};
+        constants.width = static_cast<UINT>(targetWidth);
+        constants.height = static_cast<UINT>(targetHeight);
+        constants.primitiveKind = static_cast<UINT>(settings.primitive.kind);
+        constants.previewStage = static_cast<UINT>(g_graph.Preview());
+        constants.noiseOctaves = static_cast<UINT>(std::clamp(settings.noise.octaves, 1, 8));
+        constants.noiseAmplitude = settings.noise.amplitude;
+        constants.noiseFrequency = settings.noise.frequency;
+        constants.crackWidth = settings.crack.width;
+        constants.crackDepth = settings.crack.depth;
+        constants.crackRoughness = settings.crack.roughness;
+        constants.cameraPosition[0] = basis.position.x;
+        constants.cameraPosition[1] = basis.position.y;
+        constants.cameraPosition[2] = basis.position.z;
+        constants.cameraRight[0] = basis.right.x;
+        constants.cameraRight[1] = basis.right.y;
+        constants.cameraRight[2] = basis.right.z;
+        constants.cameraUp[0] = basis.up.x;
+        constants.cameraUp[1] = basis.up.y;
+        constants.cameraUp[2] = basis.up.z;
+        constants.cameraForward[0] = basis.forward.x;
+        constants.cameraForward[1] = basis.forward.y;
+        constants.cameraForward[2] = basis.forward.z;
+        constants.viewportMin[0] = min.x;
+        constants.viewportMin[1] = min.y;
+        constants.viewportMax[0] = max.x;
+        constants.viewportMax[1] = max.y;
+        constants.viewportCenter[0] = center.x;
+        constants.viewportCenter[1] = center.y;
+        constants.focalLength = 1.0f / std::tan(fovRadians * 0.5f);
+        constants.projectionScale = viewportSize * 1.20f * g_viewport.zoom;
+
+        ID3D12DescriptorHeap* heaps[] = {g_srvHeap.Get()};
+        commandList->SetDescriptorHeaps(1, heaps);
+        commandList->SetComputeRootSignature(g_raymarchComputeRootSignature.Get());
+        commandList->SetPipelineState(g_raymarchComputePipelineState.Get());
+        commandList->SetComputeRoot32BitConstants(0, sizeof(RaymarchComputeConstants) / sizeof(UINT), &constants, 0);
+        commandList->SetComputeRootDescriptorTable(1, g_gpuRaymarchPreview.uavGpu);
+        commandList->Dispatch((static_cast<UINT>(targetWidth) + 7) / 8, (static_cast<UINT>(targetHeight) + 7) / 8, 1);
+
+        D3D12_RESOURCE_BARRIER toSrv{};
+        toSrv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toSrv.Transition.pResource = g_gpuRaymarchPreview.texture.Get();
+        toSrv.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        toSrv.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        toSrv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        commandList->ResourceBarrier(1, &toSrv);
+        ThrowIfFailed(commandList->Close(), "Close raymarch command list failed");
+
+        ID3D12CommandList* commandLists[] = {commandList.Get()};
+        g_commandQueue->ExecuteCommandLists(1, commandLists);
+        const UINT64 fenceValue = ++g_fenceLastSignaledValue;
+        ThrowIfFailed(g_commandQueue->Signal(g_fence.Get(), fenceValue), "Signal raymarch queue failed");
+        WaitForFenceValue(fenceValue);
+
+        g_gpuRaymarchPreview.yaw = g_viewport.yaw;
+        g_gpuRaymarchPreview.pitch = g_viewport.pitch;
+        g_gpuRaymarchPreview.fovDegrees = g_viewport.fovDegrees;
+        g_gpuRaymarchPreview.orbitDistance = g_viewport.orbitDistance;
+        g_gpuRaymarchPreview.zoom = g_viewport.zoom;
+        g_gpuRaymarchPreview.pan = g_viewport.pan;
+        g_gpuRaymarchPreview.graphVersion = g_graph.Evaluation().version;
+        g_gpuRaymarchPreview.previewStage = g_graph.Preview();
+        g_gpuRaymarchPreview.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g_gpuRaymarchPreview.status = "GPU Raymarch";
+        return true;
+    }
+    catch (const std::exception& ex)
+    {
+        if (error) *error = ex.what();
+        return false;
+    }
+}
+
+void DrawRaymarchPreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max)
+{
+    std::string gpuError;
+    if (RenderGpuRaymarchPreview(min, max, &gpuError))
+    {
+        drawList->PushClipRect(min, max, true);
+        drawList->AddImage(static_cast<ImTextureID>(g_gpuRaymarchPreview.srvGpu.ptr), min, max);
+        drawList->PopClipRect();
+        return;
+    }
+
+    g_gpuRaymarchPreview.status = "GPU Raymarch failed: " + gpuError;
+
+    const int targetWidth = std::clamp(static_cast<int>((max.x - min.x) / 6.0f), 96, 180);
+    const int targetHeight = std::clamp(static_cast<int>((max.y - min.y) / 6.0f), 72, 140);
+    const bool dirty =
+        g_raymarchPreviewCache.width != targetWidth ||
+        g_raymarchPreviewCache.height != targetHeight ||
+        g_raymarchPreviewCache.yaw != g_viewport.yaw ||
+        g_raymarchPreviewCache.pitch != g_viewport.pitch ||
+        g_raymarchPreviewCache.fovDegrees != g_viewport.fovDegrees ||
+        g_raymarchPreviewCache.orbitDistance != g_viewport.orbitDistance ||
+        g_raymarchPreviewCache.zoom != g_viewport.zoom ||
+        g_raymarchPreviewCache.pan.x != g_viewport.pan.x ||
+        g_raymarchPreviewCache.pan.y != g_viewport.pan.y ||
+        g_raymarchPreviewCache.graphVersion != g_graph.Evaluation().version ||
+        g_raymarchPreviewCache.previewStage != g_graph.Preview() ||
+        g_raymarchPreviewCache.pixels.empty();
+
+    if (dirty)
+    {
+        RebuildRaymarchPreviewCache(min, max);
+    }
+
+    const float cellWidth = (max.x - min.x) / static_cast<float>(std::max(1, g_raymarchPreviewCache.width));
+    const float cellHeight = (max.y - min.y) / static_cast<float>(std::max(1, g_raymarchPreviewCache.height));
+    drawList->PushClipRect(min, max, true);
+    for (int y = 0; y < g_raymarchPreviewCache.height; ++y)
+    {
+        for (int x = 0; x < g_raymarchPreviewCache.width; ++x)
+        {
+            const ImU32 color = g_raymarchPreviewCache.pixels[static_cast<size_t>(y * g_raymarchPreviewCache.width + x)];
+            if ((color >> IM_COL32_A_SHIFT) == 0)
+            {
+                continue;
+            }
+            const ImVec2 a(min.x + static_cast<float>(x) * cellWidth, min.y + static_cast<float>(y) * cellHeight);
+            const ImVec2 b(a.x + cellWidth + 0.75f, a.y + cellHeight + 0.75f);
+            drawList->AddRectFilled(a, b, color);
+        }
+    }
+    drawList->PopClipRect();
 }
 
 void DrawSurfacePointPreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, const rock::SdfPreviewStats& sdf)
@@ -939,9 +1917,16 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     drawList->AddRectFilled(min, max, ThemeColor("viewportBg", ImVec4(0.09f, 0.10f, 0.11f, 1.0f)));
     DrawViewportGrid3D(drawList, min, max, center, scale);
 
-    DrawSurfaceTrianglePreview(drawList, min, max, g_graph.Evaluation().previewSdf);
-    DrawSurfacePointPreview(drawList, min, max, g_graph.Evaluation().previewSdf);
-    DrawSurfaceWirePreview(drawList, min, max, g_graph.Evaluation().previewSdf);
+    if (g_ui.sdfPreview)
+    {
+        DrawRaymarchPreview(drawList, min, max);
+    }
+    if (g_ui.meshPreview)
+    {
+        DrawSurfaceTrianglePreview(drawList, min, max, g_graph.Evaluation().previewSdf);
+        DrawSurfacePointPreview(drawList, min, max, g_graph.Evaluation().previewSdf);
+        DrawSurfaceWirePreview(drawList, min, max, g_graph.Evaluation().previewSdf);
+    }
 
     const std::array<std::array<float, 3>, 8> vertices{{
         {{-0.6f, -0.6f, -0.6f}},
@@ -985,7 +1970,10 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     drawList->AddText(ImVec2(min.x + 16.0f, min.y + 14.0f), ThemeColor("accentText", ImVec4(0.86f, 0.88f, 0.85f, 1.0f)), title.c_str());
     drawList->AddText(ImVec2(min.x + 16.0f, min.y + 36.0f), ThemeColor("mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)), "Right-handed, Y-up, 10 x 10 m grid");
     DrawViewportAxisGizmo(drawList, min, max);
-    DrawSdfSliceOverlay(drawList, min, max, g_graph.Evaluation().previewSdf);
+    if (g_ui.meshPreview)
+    {
+        DrawSdfSliceOverlay(drawList, min, max, g_graph.Evaluation().previewSdf);
+    }
 }
 
 ImVec4 NodeAccentColor(rock::NodeKind kind)
@@ -1433,6 +2421,7 @@ void DrawComputePanel()
             settings.previewBackend = static_cast<rock::ComputeBackend>(backend);
             g_graph.MarkDirty("Preview compute backend changed");
             EvaluateGraph();
+            SaveAppSettingsSilently();
         }
 
         ImGui::EndTable();
@@ -1538,14 +2527,77 @@ void DrawUi()
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
     ImGui::Begin("Rock Generator Shell", nullptr, shellFlags);
 
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 5.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, ImVec2(10.0f, 6.0f));
     if (ImGui::BeginMenuBar())
     {
         if (ImGui::BeginMenu("ファイル"))
         {
             ImGui::MenuItem("新規", "Ctrl+N", false, false);
-            ImGui::MenuItem("開く", "Ctrl+O", false, false);
-            ImGui::MenuItem("保存", "Ctrl+S", false, false);
-            ImGui::MenuItem("名前を付けて保存", nullptr, false, false);
+            if (ImGui::MenuItem("開く", "Ctrl+O"))
+            {
+                if (const std::optional<std::filesystem::path> path = ShowProjectFileDialog(false))
+                {
+                    std::string error;
+                    if (!LoadProjectFromFile(*path, &error))
+                    {
+                        g_projectStatus = "Load failed: " + error;
+                    }
+                }
+            }
+            if (ImGui::MenuItem("保存", "Ctrl+S"))
+            {
+                std::optional<std::filesystem::path> path = g_projectPath.empty() ? ShowProjectFileDialog(true) : std::optional<std::filesystem::path>(g_projectPath);
+                if (path)
+                {
+                    std::string error;
+                    if (!SaveProjectToFile(*path, &error))
+                    {
+                        g_projectStatus = "Save failed: " + error;
+                    }
+                }
+            }
+            if (ImGui::MenuItem("名前を付けて保存"))
+            {
+                if (const std::optional<std::filesystem::path> path = ShowProjectFileDialog(true))
+                {
+                    std::string error;
+                    if (!SaveProjectToFile(*path, &error))
+                    {
+                        g_projectStatus = "Save failed: " + error;
+                    }
+                }
+            }
+            if (ImGui::BeginMenu("最近使ったファイル", !g_recentProjectPaths.empty()))
+            {
+                for (size_t index = 0; index < g_recentProjectPaths.size(); ++index)
+                {
+                    const std::filesystem::path& recentPath = g_recentProjectPaths[index];
+                    const std::string label =
+                        std::to_string(index + 1) + ". " + PathToUtf8(recentPath.filename()) + "##RecentProject" + std::to_string(index);
+                    if (ImGui::MenuItem(label.c_str()))
+                    {
+                        std::string error;
+                        if (!LoadProjectFromFile(recentPath, &error))
+                        {
+                            g_projectStatus = "Load failed: " + error;
+                        }
+                    }
+                    if (ImGui::IsItemHovered())
+                    {
+                        ImGui::SetTooltip("%s", PathToUtf8(recentPath).c_str());
+                    }
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("履歴をクリア"))
+                {
+                    g_recentProjectPaths.clear();
+                    SaveAppSettingsSilently();
+                }
+                ImGui::EndMenu();
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("終了"))
             {
@@ -1565,8 +2617,14 @@ void DrawUi()
         }
         if (ImGui::BeginMenu("表示"))
         {
-            ImGui::MenuItem("Mesh Preview", nullptr, &g_ui.meshPreview);
-            ImGui::MenuItem("SDF Raymarch Preview", nullptr, &g_ui.sdfPreview, false);
+            if (ImGui::MenuItem("Mesh Preview", nullptr, &g_ui.meshPreview))
+            {
+                SaveAppSettingsSilently();
+            }
+            if (ImGui::MenuItem("SDF Raymarch Preview", nullptr, &g_ui.sdfPreview))
+            {
+                SaveAppSettingsSilently();
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("設定"))
@@ -1581,6 +2639,7 @@ void DrawUi()
                         settings.previewBackend = backend;
                         g_graph.MarkDirty("Preview compute backend changed");
                         EvaluateGraph();
+                        SaveAppSettingsSilently();
                     }
                 };
                 drawBackendItem("CPU", rock::ComputeBackend::Cpu);
@@ -1596,6 +2655,7 @@ void DrawUi()
                     if (ImGui::MenuItem(themeInfo.name.c_str(), nullptr, selected))
                     {
                         g_themeManager.ApplyTheme(themeInfo.id);
+                        SaveAppSettingsSilently();
                     }
                 }
                 ImGui::EndMenu();
@@ -1638,6 +2698,7 @@ void DrawUi()
         }
         ImGui::EndMenuBar();
     }
+    ImGui::PopStyleVar(4);
 
     const ImVec2 content = ImGui::GetContentRegionAvail();
     const float statusBarHeight = ImGui::GetTextLineHeight() + 16.0f;
@@ -1716,7 +2777,7 @@ void DrawUi()
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 4.0f));
     ImGui::BeginChild("Status Bar", ImVec2(0.0f, statusBarHeight), true, fixedPaneFlags);
     const rock::EvaluationSummary& evaluation = g_graph.Evaluation();
-    ImGui::Text("%s | %s | %s", evaluation.dirty ? "Dirty" : "Evaluated", rock::ToString(evaluation.previewStage).data(), g_exportStatus.c_str());
+    ImGui::Text("%s | %s | %s | %s", evaluation.dirty ? "Dirty" : "Evaluated", rock::ToString(evaluation.previewStage).data(), g_projectStatus.c_str(), g_exportStatus.c_str());
     ImGui::EndChild();
     ImGui::PopStyleVar();
 
@@ -1831,8 +2892,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         LoadJapaneseFont(io);
-        g_themeManager.LoadThemes(std::filesystem::path("data") / "ui_themes");
+        g_themeManager.LoadThemes(DataDirectory() / "ui_themes");
         g_themeManager.ApplyTheme("road_editor_dark");
+        std::string appSettingsError;
+        if (!LoadAppSettings(&appSettingsError) && !appSettingsError.empty())
+        {
+            g_projectStatus = "App settings load failed: " + appSettingsError;
+        }
+        EvaluateGraph();
 
         ImGui_ImplWin32_Init(g_hwnd);
         ImGui_ImplDX12_InitInfo dx12InitInfo{};
@@ -1877,6 +2944,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         }
 
         WaitForLastSubmittedFrame();
+        SaveAppSettingsSilently();
         ed::DestroyEditor(g_nodeEditor);
         g_nodeEditor = nullptr;
         ImGui_ImplDX12_Shutdown();

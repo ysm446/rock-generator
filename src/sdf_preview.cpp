@@ -179,6 +179,11 @@ float EvaluateStageSdf(Vec3 p, const GraphSettings& settings, PreviewStage stage
 }
 } // namespace
 
+float EvaluateSdfAt(const GraphSettings& settings, float x, float y, float z, PreviewStage stage)
+{
+    return EvaluateStageSdf({x, y, z}, settings, stage);
+}
+
 SdfPreviewStats BuildDenseSdfPreview(const GraphSettings& settings, int resolution, PreviewStage stage)
 {
     SdfPreviewStats stats;

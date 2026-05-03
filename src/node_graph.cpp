@@ -150,6 +150,17 @@ bool NodeGraph::DeleteLink(GraphId linkId)
     return true;
 }
 
+void NodeGraph::ReplaceLinks(std::vector<Link> links)
+{
+    links_ = std::move(links);
+    nextLinkId_ = 101;
+    for (const Link& link : links_)
+    {
+        nextLinkId_ = std::max(nextLinkId_, link.id + 1);
+    }
+    MarkDirty("Project links loaded");
+}
+
 bool NodeGraph::SetPreviewStage(PreviewStage stage)
 {
     if (evaluation_.previewStage == stage)
