@@ -10,12 +10,10 @@ Windows desktop prototype for a node-based SDF rock generation tool.
 - imgui-node-editor backed node graph
 - Internal `NodeGraph` model with nodes, pins, links, parameters, and evaluation status
 - CPU dense SDF preview evaluator for primitive, noise, and crack parameters
-- First-pass layout:
-  - menu bar
-  - node graph area
-  - central viewport
-  - properties panel
-  - asset/export panel
+- Split production layout:
+  - left preview viewport
+  - right-top node network
+  - right-bottom inspector tabs for properties, stats, camera, compute, and export
 - Animated cube placeholder in the viewport
 - Editable prototype parameters for primitive, noise, and crack settings
 - SDF preview stats for resolution, SDF range, fill ratio, and estimated volume
@@ -27,7 +25,7 @@ Windows desktop prototype for a node-based SDF rock generation tool.
 - Debug OBJ export to `exports/rock_debug.obj`
 - Interactive viewport orbit, pan, zoom, and reset controls
 - Node-stage preview: selecting graph nodes shows that generation stage in the viewport
-- Output Mesh node controls final mesh resolution, LOD, iso value, and viewport display modes for Mesh or lightweight Voxels
+- View menu toggles Mesh, lightweight Voxels, and GPU Raymarch previews
 - Final mesh evaluation now builds indexed topology with shared vertices, triangle indices, unique edges, and vertex normals
 - JSON-driven UI themes in `data/ui_themes`, selectable from `設定 > UIテーマ`
 - Preview compute backend selection for CPU / GPU Preview / Auto; GPU preview uses D3D12 compute for the preview SDF values while final output remains CPU-based.

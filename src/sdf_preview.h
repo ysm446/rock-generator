@@ -8,5 +8,5 @@ namespace rock
 {
 float EvaluateSdfAt(const GraphSettings& settings, float x, float y, float z, PreviewStage stage);
 SdfPreviewStats BuildDenseSdfPreview(const GraphSettings& settings, int resolution, PreviewStage stage);
-SdfPreviewStats BuildDenseSdfPreviewFromValues(int resolution, const std::vector<float>& sdfValues);
+SdfPreviewStats BuildDenseSdfPreviewFromValues(const GraphSettings& settings, int resolution, const std::vector<float>& sdfValues);
 }

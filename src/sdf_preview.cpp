@@ -513,7 +513,7 @@ SdfPreviewStats BuildDenseSdfPreview(const GraphSettings& settings, int resoluti
     return stats;
 }
 
-SdfPreviewStats BuildDenseSdfPreviewFromValues(int resolution, const std::vector<float>& sdfValues)
+SdfPreviewStats BuildDenseSdfPreviewFromValues(const GraphSettings& settings, int resolution, const std::vector<float>& sdfValues)
 {
     SdfPreviewStats stats;
     stats.resolution = std::max(8, resolution);
@@ -561,7 +561,6 @@ SdfPreviewStats BuildDenseSdfPreviewFromValues(int resolution, const std::vector
         }
     }
 
-    GraphSettings settings;
     BuildPreviewGeometry(stats, sdfValues, settings);
 
     stats.fillRatio = stats.totalVoxels > 0 ? static_cast<float>(stats.insideVoxels) / static_cast<float>(stats.totalVoxels) : 0.0f;

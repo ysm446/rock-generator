@@ -75,6 +75,7 @@ std::array<ComPtr<ID3D12Resource>, kFrameCount> g_renderTargets;
 std::array<bool, kSrvDescriptorCount> g_srvDescriptorUsed{};
 ed::EditorContext* g_nodeEditor = nullptr;
 bool g_nodePositionsInitialized = false;
+bool g_nodeGraphNavigatedToContent = false;
 rock::NodeGraph g_graph = rock::NodeGraph::CreateDefaultRockGraph();
 std::string g_exportStatus = "No export yet";
 std::string g_projectStatus = "No project file";
@@ -526,6 +527,8 @@ std::filesystem::path RaymarchPreviewShaderPath()
 }
 
 void EvaluateGraph();
+void ResetViewport();
+ImVec2 InitialNodePosition(rock::NodeKind kind);
 
 std::optional<std::filesystem::path> ShowProjectFileDialog(bool save)
 {
@@ -632,6 +635,7 @@ bool SaveAppSettings(std::string* error = nullptr)
         root["previewVisibility"] = {
             {"mesh", g_ui.meshPreview},
             {"raymarch", g_ui.sdfPreview},
+            {"meshDisplayMode", static_cast<int>(settings.outputMesh.displayMode)},
         };
         root["recentProjects"] = nlohmann::json::array();
         for (const std::filesystem::path& recentPath : g_recentProjectPaths)
@@ -715,6 +719,7 @@ bool LoadAppSettings(std::string* error = nullptr)
         const nlohmann::json visibilityJson = root.value("previewVisibility", nlohmann::json::object());
         g_ui.meshPreview = visibilityJson.value("mesh", g_ui.meshPreview);
         g_ui.sdfPreview = visibilityJson.value("raymarch", g_ui.sdfPreview);
+        settings.outputMesh.displayMode = static_cast<rock::MeshDisplayMode>(std::clamp(visibilityJson.value("meshDisplayMode", static_cast<int>(settings.outputMesh.displayMode)), 0, 1));
 
         g_recentProjectPaths.clear();
         if (root.contains("recentProjects") && root["recentProjects"].is_array())
@@ -748,6 +753,37 @@ bool LoadAppSettings(std::string* error = nullptr)
         if (error) *error = ex.what();
         return false;
     }
+}
+
+void ResetNodeEditorViewToDefault()
+{
+    g_selectedNodeId = 0;
+    g_nodePositionsInitialized = false;
+    g_nodeGraphNavigatedToContent = false;
+    if (g_nodeEditor != nullptr)
+    {
+        ed::SetCurrentEditor(g_nodeEditor);
+        ed::ClearSelection();
+        for (const rock::Node& node : g_graph.Nodes())
+        {
+            ed::SetNodePosition(ed::NodeId(node.id), InitialNodePosition(node.kind));
+        }
+        ed::NavigateToContent(0.0f);
+        ed::SetCurrentEditor(nullptr);
+        g_nodePositionsInitialized = true;
+        g_nodeGraphNavigatedToContent = true;
+    }
+}
+
+void NewProject()
+{
+    g_graph = rock::NodeGraph::CreateDefaultRockGraph();
+    g_projectPath.clear();
+    g_projectStatus = "New project";
+    g_exportStatus = "No export yet";
+    ResetViewport();
+    ResetNodeEditorViewToDefault();
+    EvaluateGraph();
 }
 
 bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
@@ -1191,7 +1227,7 @@ bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, rock::PreviewSta
         D3D12_RANGE writeRange{0, 0};
         readbackBuffer->Unmap(0, &writeRange);
 
-        outStats = rock::BuildDenseSdfPreviewFromValues(static_cast<int>(clampedResolution), sdfValues);
+        outStats = rock::BuildDenseSdfPreviewFromValues(settings, static_cast<int>(clampedResolution), sdfValues);
         return true;
     }
     catch (const std::exception& ex)
@@ -2072,15 +2108,15 @@ ImVec2 InitialNodePosition(rock::NodeKind kind)
     switch (kind)
     {
     case rock::NodeKind::PrimitiveSdf:
-        return ImVec2(24.0f, 48.0f);
+        return ImVec2(40.0f, 64.0f);
     case rock::NodeKind::NoiseWarp:
-        return ImVec2(24.0f, 178.0f);
+        return ImVec2(220.0f, 64.0f);
     case rock::NodeKind::CrackField:
-        return ImVec2(24.0f, 308.0f);
+        return ImVec2(400.0f, 64.0f);
     case rock::NodeKind::OutputMesh:
-        return ImVec2(24.0f, 438.0f);
+        return ImVec2(580.0f, 64.0f);
     default:
-        return ImVec2(24.0f, 48.0f);
+        return ImVec2(40.0f, 64.0f);
     }
 }
 
@@ -2183,6 +2219,12 @@ void DrawNodeGraph()
         }
     }
     g_nodePositionsInitialized = true;
+
+    if (!g_nodeGraphNavigatedToContent)
+    {
+        ed::NavigateToContent(0.0f);
+        g_nodeGraphNavigatedToContent = true;
+    }
 
     for (const rock::Link& link : g_graph.Links())
     {
@@ -2675,7 +2717,10 @@ void DrawUi()
     {
         if (ImGui::BeginMenu("ファイル"))
         {
-            ImGui::MenuItem("新規", "Ctrl+N", false, false);
+            if (ImGui::MenuItem("新規", "Ctrl+N"))
+            {
+                NewProject();
+            }
             if (ImGui::MenuItem("開く", "Ctrl+O"))
             {
                 if (const std::optional<std::filesystem::path> path = ShowProjectFileDialog(false))
@@ -2757,11 +2802,36 @@ void DrawUi()
         }
         if (ImGui::BeginMenu("表示"))
         {
-            if (ImGui::MenuItem("Mesh Preview", nullptr, &g_ui.meshPreview))
-            {
+            rock::GraphSettings& settings = g_graph.Settings();
+            const auto toggleMeshDisplayMode = [&](rock::MeshDisplayMode mode) {
+                if (g_ui.meshPreview && settings.outputMesh.displayMode == mode)
+                {
+                    g_ui.meshPreview = false;
+                    SaveAppSettingsSilently();
+                    return;
+                }
+
+                g_ui.meshPreview = true;
+                if (settings.outputMesh.displayMode != mode)
+                {
+                    settings.outputMesh.displayMode = mode;
+                    g_graph.MarkDirty("Output mesh display mode changed");
+                    EvaluateGraph();
+                }
                 SaveAppSettingsSilently();
+            };
+
+            const bool meshSelected = g_ui.meshPreview && settings.outputMesh.displayMode == rock::MeshDisplayMode::Mesh;
+            if (ImGui::MenuItem("Mesh", nullptr, meshSelected))
+            {
+                toggleMeshDisplayMode(rock::MeshDisplayMode::Mesh);
             }
-            if (ImGui::MenuItem("SDF Raymarch Preview", nullptr, &g_ui.sdfPreview))
+            const bool voxelSelected = g_ui.meshPreview && settings.outputMesh.displayMode == rock::MeshDisplayMode::Voxels;
+            if (ImGui::MenuItem("Voxels", nullptr, voxelSelected))
+            {
+                toggleMeshDisplayMode(rock::MeshDisplayMode::Voxels);
+            }
+            if (ImGui::MenuItem("Raymarch", nullptr, &g_ui.sdfPreview))
             {
                 SaveAppSettingsSilently();
             }
@@ -2842,39 +2912,16 @@ void DrawUi()
 
     const ImVec2 content = ImGui::GetContentRegionAvail();
     const float statusBarHeight = ImGui::GetTextLineHeight() + 16.0f;
-    const float leftWidth = std::clamp(content.x * 0.24f, 260.0f, 420.0f);
-    const float rightWidth = std::clamp(content.x * 0.24f, 300.0f, 460.0f);
     const float workHeight = std::max(260.0f, content.y - statusBarHeight);
-    const float viewportWidth = std::max(360.0f, content.x - leftWidth - rightWidth);
+    const float rightWidth = std::clamp(content.x * 0.42f, 480.0f, std::min(820.0f, std::max(360.0f, content.x - 360.0f)));
+    const float previewWidth = std::max(360.0f, content.x - rightWidth);
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
-    ImGui::BeginChild("Left Sidebar", ImVec2(leftWidth, workHeight), true, fixedPaneFlags);
-    if (ImGui::BeginTabBar("LeftSidebarTabs"))
-    {
-        if (ImGui::BeginTabItem("ノード"))
-        {
-            DrawNodeGraph();
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("エクスポート"))
-        {
-            DrawAssetExportPanel();
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
-    }
-    ImGui::EndChild();
-    ImGui::PopStyleVar(2);
-
-    ImGui::SameLine();
-
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::BeginChild("Viewport", ImVec2(viewportWidth, workHeight), true, fixedPaneFlags);
+    ImGui::BeginChild("Preview Viewport", ImVec2(previewWidth, workHeight), true, fixedPaneFlags);
     const ImVec2 min = ImGui::GetCursorScreenPos();
     const ImVec2 max(min.x + ImGui::GetContentRegionAvail().x, min.y + ImGui::GetContentRegionAvail().y);
     DrawViewportCube(min, max, timeSeconds);
@@ -2886,8 +2933,18 @@ void DrawUi()
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 8.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
-    ImGui::BeginChild("Right Sidebar", ImVec2(rightWidth, workHeight), true, fixedPaneFlags);
-    if (ImGui::BeginTabBar("RightSidebarTabs"))
+    ImGui::BeginChild("Right Work Column", ImVec2(rightWidth, workHeight), false, fixedPaneFlags);
+    const float rightColumnHeight = ImGui::GetContentRegionAvail().y;
+    const float nodeHeight = std::clamp(rightColumnHeight * 0.56f, 220.0f, std::max(220.0f, rightColumnHeight - 190.0f));
+
+    ImGui::BeginChild("Node Network", ImVec2(0.0f, nodeHeight), true, fixedPaneFlags);
+    ImGui::TextUnformatted("ノードネットワーク");
+    ImGui::Separator();
+    DrawNodeGraph();
+    ImGui::EndChild();
+
+    ImGui::BeginChild("Inspector", ImVec2(0.0f, 0.0f), true);
+    if (ImGui::BeginTabBar("InspectorTabs"))
     {
         if (ImGui::BeginTabItem("プロパティ"))
         {
@@ -2909,8 +2966,14 @@ void DrawUi()
             DrawComputePanel();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("エクスポート"))
+        {
+            DrawAssetExportPanel();
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
+    ImGui::EndChild();
     ImGui::EndChild();
     ImGui::PopStyleVar(2);
 
@@ -3055,6 +3118,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 
         ed::Config nodeEditorConfig{};
         nodeEditorConfig.SettingsFile = "RockGeneratorNodeEditor.json";
+        nodeEditorConfig.NavigateButtonIndex = 2;
         g_nodeEditor = ed::CreateEditor(&nodeEditorConfig);
 
         MSG msg{};
