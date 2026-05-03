@@ -737,9 +737,13 @@ bool SaveAppSettings(std::string* error = nullptr)
         root["previewVisibility"] = {
             {"mesh", g_ui.meshPreview},
             {"raymarch", g_ui.sdfPreview},
-            {"meshDisplayMode", static_cast<int>(settings.outputMesh.displayMode)},
-            {"meshWireframe", settings.outputMesh.showWireframe},
-            {"centerSlice", settings.outputMesh.showSlice},
+            {"meshDisplayMode", static_cast<int>(settings.preview.displayMode)},
+            {"meshSurface", settings.preview.showSurface},
+            {"meshWireframe", settings.preview.showWireframe},
+            {"surfacePoints", settings.preview.showPoints},
+            {"centerSlice", settings.preview.showSlice},
+            {"previewResolution", settings.preview.resolution},
+            {"previewLod", settings.preview.lod},
         };
         root["layout"] = {
             {"rightPaneWidth", g_ui.rightPaneWidth},
@@ -827,9 +831,13 @@ bool LoadAppSettings(std::string* error = nullptr)
         const nlohmann::json visibilityJson = root.value("previewVisibility", nlohmann::json::object());
         g_ui.meshPreview = visibilityJson.value("mesh", g_ui.meshPreview);
         g_ui.sdfPreview = visibilityJson.value("raymarch", g_ui.sdfPreview);
-        settings.outputMesh.displayMode = static_cast<rock::MeshDisplayMode>(std::clamp(visibilityJson.value("meshDisplayMode", static_cast<int>(settings.outputMesh.displayMode)), 0, 1));
-        settings.outputMesh.showWireframe = visibilityJson.value("meshWireframe", settings.outputMesh.showWireframe);
-        settings.outputMesh.showSlice = visibilityJson.value("centerSlice", settings.outputMesh.showSlice);
+        settings.preview.displayMode = static_cast<rock::MeshDisplayMode>(std::clamp(visibilityJson.value("meshDisplayMode", static_cast<int>(settings.preview.displayMode)), 0, 1));
+        settings.preview.showSurface = visibilityJson.value("meshSurface", settings.preview.showSurface);
+        settings.preview.showWireframe = visibilityJson.value("meshWireframe", settings.preview.showWireframe);
+        settings.preview.showPoints = visibilityJson.value("surfacePoints", settings.preview.showPoints);
+        settings.preview.showSlice = visibilityJson.value("centerSlice", settings.preview.showSlice);
+        settings.preview.resolution = std::clamp(visibilityJson.value("previewResolution", settings.preview.resolution), 16, 96);
+        settings.preview.lod = std::clamp(visibilityJson.value("previewLod", settings.preview.lod), 0, 4);
 
         const nlohmann::json layoutJson = root.value("layout", nlohmann::json::object());
         g_ui.rightPaneWidth = std::max(0.0f, layoutJson.value("rightPaneWidth", g_ui.rightPaneWidth));
@@ -935,11 +943,6 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
                 {"resolution", settings.outputMesh.resolution},
                 {"lod", settings.outputMesh.lod},
                 {"isoValue", settings.outputMesh.isoValue},
-                {"displayMode", static_cast<int>(settings.outputMesh.displayMode)},
-                {"showSurface", settings.outputMesh.showSurface},
-                {"showWireframe", settings.outputMesh.showWireframe},
-                {"showPoints", settings.outputMesh.showPoints},
-                {"showSlice", settings.outputMesh.showSlice},
             }},
             {"previewBackend", static_cast<int>(settings.previewBackend)},
         };
@@ -1072,11 +1075,6 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         settings.outputMesh.resolution = std::clamp(outputMeshJson.value("resolution", settings.outputMesh.resolution), 16, 96);
         settings.outputMesh.lod = std::clamp(outputMeshJson.value("lod", settings.outputMesh.lod), 0, 4);
         settings.outputMesh.isoValue = std::clamp(outputMeshJson.value("isoValue", settings.outputMesh.isoValue), -0.2f, 0.2f);
-        settings.outputMesh.displayMode = static_cast<rock::MeshDisplayMode>(std::clamp(outputMeshJson.value("displayMode", static_cast<int>(settings.outputMesh.displayMode)), 0, 1));
-        settings.outputMesh.showSurface = outputMeshJson.value("showSurface", settings.outputMesh.showSurface);
-        settings.outputMesh.showWireframe = outputMeshJson.value("showWireframe", settings.outputMesh.showWireframe);
-        settings.outputMesh.showPoints = outputMeshJson.value("showPoints", settings.outputMesh.showPoints);
-        settings.outputMesh.showSlice = outputMeshJson.value("showSlice", settings.outputMesh.showSlice);
         settings.previewBackend = static_cast<rock::ComputeBackend>(std::clamp(settingsJson.value("previewBackend", static_cast<int>(settings.previewBackend)), 0, 2));
 
         const nlohmann::json viewportJson = root.value("viewport", nlohmann::json::object());
@@ -1405,7 +1403,7 @@ bool EnsureMeshPreviewPipeline(std::string* error)
 
     psoDesc.PS = {psEdgeBlob->GetBufferPointer(), psEdgeBlob->GetBufferSize()};
     psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
-    psoDesc.RasterizerState.DepthBias = -64;
+    psoDesc.RasterizerState.DepthBias = 0;
     psoDesc.DepthStencilState.DepthEnable = TRUE;
     psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
@@ -1508,7 +1506,7 @@ void EvaluateGraph()
 
     rock::SdfPreviewStats gpuPreview;
     std::string error;
-    const int meshResolution = std::clamp(settings.outputMesh.resolution / (1 << std::clamp(settings.outputMesh.lod, 0, 4)), 16, 96);
+    const int meshResolution = std::clamp(settings.preview.resolution / (1 << std::clamp(settings.preview.lod, 0, 4)), 16, 96);
     if (TryBuildGpuPreviewSdf(settings, g_graph.PreviewPipeline(), meshResolution, gpuPreview, &error))
     {
         g_graph.EvaluateWithPreview(std::move(gpuPreview), settings.previewBackend, rock::ComputeBackend::GpuPreview, false);
@@ -2371,7 +2369,7 @@ void DrawMeshPreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max,
             continue;
         }
 
-        if (showSurface)
+        if (showSurface && !showWireframe)
         {
             drawList->AddTriangleFilled(a, b, c, ThemeColor("surfaceFill", ImVec4(0.42f, 0.42f, 0.42f, 1.0f)));
         }
@@ -2503,7 +2501,7 @@ bool RenderGpuMeshPreview(const ImVec2& min, const ImVec2& max, bool showSurface
         commandList->SetGraphicsRootSignature(g_meshPreviewRootSignature.Get());
         commandList->SetGraphicsRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
 
-        if (showSurface && g_gpuMeshPreview.triIndexCount > 0)
+        if (showSurface && !showWireframe && g_gpuMeshPreview.triIndexCount > 0)
         {
             D3D12_INDEX_BUFFER_VIEW ibv{g_gpuMeshPreview.indexBuffer->GetGPUVirtualAddress(), g_gpuMeshPreview.triIndexCount * sizeof(UINT), DXGI_FORMAT_R32_UINT};
             commandList->IASetIndexBuffer(&ibv);
@@ -2559,7 +2557,7 @@ void DrawGpuMeshPreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& m
     std::string error;
     if (!RenderGpuMeshPreview(min, max, showSurface, showWireframe, &error))
     {
-        DrawMeshPreview(drawList, min, max, mesh, showSurface, false);
+        DrawMeshPreview(drawList, min, max, mesh, showSurface && !showWireframe, false);
         if (showWireframe) DrawMeshEdgePreview(drawList, min, max, mesh);
         return;
     }
@@ -2590,10 +2588,10 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     }
     if (g_ui.meshPreview)
     {
-        const rock::OutputMeshSettings& outputMesh = g_graph.Settings().outputMesh;
+        const rock::PreviewSettings& preview = g_graph.Settings().preview;
         DrawGpuMeshPreview(drawList, min, max, g_graph.Evaluation().previewMesh,
-                           outputMesh.showSurface, outputMesh.showWireframe);
-        if (outputMesh.showPoints)
+                           preview.showSurface, preview.showWireframe);
+        if (preview.showPoints)
         {
             DrawSurfacePointPreview(drawList, min, max, g_graph.Evaluation().previewSdf);
         }
@@ -2650,7 +2648,7 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     drawList->AddRect(fpsMin, fpsMax, ThemeColor("border", ImVec4(0.20f, 0.23f, 0.22f, 0.70f)), 4.0f);
     drawList->AddText(ImVec2(fpsMin.x + fpsPadding.x, fpsMin.y + fpsPadding.y), ThemeColor("accentText", ImVec4(0.86f, 0.88f, 0.85f, 1.0f)), fpsText);
     DrawViewportAxisGizmo(drawList, min, max);
-    if (g_graph.Settings().outputMesh.showSlice)
+    if (g_graph.Settings().preview.showSlice)
     {
         DrawSdfSliceOverlay(drawList, min, max, g_graph.Evaluation().previewSdf);
     }
@@ -2680,11 +2678,11 @@ ImVec2 InitialNodePosition(rock::NodeKind kind)
     case rock::NodeKind::PrimitiveSdf:
         return ImVec2(40.0f, 64.0f);
     case rock::NodeKind::NoiseWarp:
-        return ImVec2(220.0f, 64.0f);
+        return ImVec2(320.0f, 64.0f);
     case rock::NodeKind::CrackField:
-        return ImVec2(400.0f, 64.0f);
+        return ImVec2(600.0f, 64.0f);
     case rock::NodeKind::OutputMesh:
-        return ImVec2(580.0f, 64.0f);
+        return ImVec2(880.0f, 64.0f);
     default:
         return ImVec2(40.0f, 64.0f);
     }
@@ -2768,6 +2766,10 @@ void DrawRoundPin(const rock::Pin& pin)
     const ImVec2 min = ImGui::GetItemRectMin();
     const ImVec2 max = ImGui::GetItemRectMax();
     const ImVec2 center((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
+    const ImVec2 pivotMin(center.x - 6.0f, center.y - 6.0f);
+    const ImVec2 pivotMax(center.x + 6.0f, center.y + 6.0f);
+    ed::PinRect(min, max);
+    ed::PinPivotRect(pivotMin, pivotMax);
     const ImVec4 color = PinColor(pin);
     ImGui::GetWindowDrawList()->AddCircle(center, 4.3f, ColorToU32(color), 16, 1.6f);
 }
@@ -2803,8 +2805,6 @@ void DrawRockNode(const rock::Node& node)
     {
         ImGui::SetCursorPos(ImVec2(rowStartX, rowY));
         ed::BeginPin(ed::PinId(node.inputs.front().id), ed::PinKind::Input);
-        ed::PinPivotAlignment(ImVec2(0.0f, 0.5f));
-        ed::PinPivotSize(ImVec2(12.0f, 12.0f));
         DrawRoundPin(node.inputs.front());
         ed::EndPin();
         ImGui::SameLine();
@@ -2826,8 +2826,6 @@ void DrawRockNode(const rock::Node& node)
         ImGui::SameLine();
         ImGui::SetCursorPosY(rowY);
         ed::BeginPin(ed::PinId(node.outputs.front().id), ed::PinKind::Output);
-        ed::PinPivotAlignment(ImVec2(1.0f, 0.5f));
-        ed::PinPivotSize(ImVec2(12.0f, 12.0f));
         DrawRoundPin(output);
         ed::EndPin();
     }
@@ -3223,74 +3221,89 @@ void DrawPropertiesPanel()
 
     if (selectedNode->kind == rock::NodeKind::OutputMesh)
     {
-        if (ImGui::BeginTable("OutputMeshPropertyRows", 2, ImGuiTableFlags_SizingStretchProp))
-        {
-            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
-            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TextDisabled("メッシュ生成設定はメッシュ設定タブに移動しました。");
+        ImGui::TextDisabled("書き出し操作はエクスポートタブから実行できます。");
+    }
+}
 
-            if (DrawPropertyIntRow("Resolution", "OutputMeshResolution", &settings.outputMesh.resolution, 16, 96, "Output mesh resolution changed"))
-            {
-                EvaluateGraph();
-            }
-            if (DrawPropertyIntRow("LOD", "OutputMeshLod", &settings.outputMesh.lod, 0, 4, "Output mesh LOD changed"))
-            {
-                EvaluateGraph();
-            }
-            if (DrawPropertyFloatRow("Iso Value", "OutputMeshIsoValue", &settings.outputMesh.isoValue, -0.2f, 0.2f, "Output mesh iso value changed"))
-            {
-                EvaluateGraph();
-            }
-            int displayMode = static_cast<int>(settings.outputMesh.displayMode);
-            if (DrawPropertyComboRow("Display", "OutputMeshDisplay", &displayMode, "Mesh\0Voxels\0"))
-            {
-                settings.outputMesh.displayMode = static_cast<rock::MeshDisplayMode>(displayMode);
-                g_graph.MarkDirty("Output mesh display mode changed");
-                EvaluateGraph();
-            }
-            if (DrawPropertyBoolRow("Surface", "OutputMeshSurface", &settings.outputMesh.showSurface, "Output mesh surface visibility changed"))
-            {
-                EvaluateGraph();
-            }
-            if (DrawPropertyBoolRow("Wireframe", "OutputMeshWireframe", &settings.outputMesh.showWireframe, "Output mesh wireframe visibility changed"))
-            {
-                EvaluateGraph();
-            }
-            if (DrawPropertyBoolRow("Points", "OutputMeshPoints", &settings.outputMesh.showPoints, "Output mesh point visibility changed"))
-            {
-                EvaluateGraph();
-            }
-            if (DrawPropertyBoolRow("Slice", "OutputMeshSlice", &settings.outputMesh.showSlice, "Output mesh slice visibility changed"))
-            {
-                EvaluateGraph();
-            }
+void DrawMeshSettingsPanel()
+{
+    rock::GraphSettings& settings = g_graph.Settings();
+    if (ImGui::BeginTable("MeshSettingsRows", 2, ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
-            ImGui::EndTable();
-        }
-        ImGui::Spacing();
-        if (ImGui::Button("Build Mesh"))
+        if (DrawPropertyIntRow("Output Resolution", "MeshSettingsOutputResolution", &settings.outputMesh.resolution, 16, 96, "Output mesh resolution changed"))
         {
             EvaluateGraph();
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Export OBJ"))
+        if (DrawPropertyIntRow("Output LOD", "MeshSettingsOutputLod", &settings.outputMesh.lod, 0, 4, "Output mesh LOD changed"))
         {
-            if (g_graph.Evaluation().dirty)
-            {
-                EvaluateGraph();
-            }
-
-            std::string error;
-            const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_mesh.obj";
-            if (rock::ExportMeshObj(g_graph.Evaluation().finalMesh, exportPath, &error))
-            {
-                g_exportStatus = "Exported " + exportPath.string();
-            }
-            else
-            {
-                g_exportStatus = "Export failed: " + error;
-            }
+            EvaluateGraph();
         }
-        ImGui::TextWrapped("%s", g_exportStatus.c_str());
+        if (DrawPropertyFloatRow("Iso Value", "MeshSettingsIsoValue", &settings.outputMesh.isoValue, -0.2f, 0.2f, "Output mesh iso value changed"))
+        {
+            EvaluateGraph();
+        }
+
+        ImGui::EndTable();
+    }
+}
+
+void DrawDisplaySettingsPanel()
+{
+    rock::GraphSettings& settings = g_graph.Settings();
+    if (ImGui::BeginTable("DisplaySettingsRows", 2, ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+        if (DrawPropertyBoolRow("Mesh Preview", "DisplayMeshPreview", &g_ui.meshPreview, "Mesh preview visibility changed"))
+        {
+            SaveAppSettingsSilently();
+        }
+        if (DrawPropertyBoolRow("Raymarch", "DisplayRaymarch", &g_ui.sdfPreview, "Raymarch preview visibility changed"))
+        {
+            SaveAppSettingsSilently();
+        }
+        if (DrawPropertyIntRow("Resolution", "DisplayPreviewResolution", &settings.preview.resolution, 16, 96, "Preview resolution changed"))
+        {
+            EvaluateGraph();
+            SaveAppSettingsSilently();
+        }
+        if (DrawPropertyIntRow("LOD", "DisplayPreviewLod", &settings.preview.lod, 0, 4, "Preview LOD changed"))
+        {
+            EvaluateGraph();
+            SaveAppSettingsSilently();
+        }
+
+        int displayMode = static_cast<int>(settings.preview.displayMode);
+        if (DrawPropertyComboRow("Display", "DisplayMeshMode", &displayMode, "Mesh\0Voxels\0"))
+        {
+            settings.preview.displayMode = static_cast<rock::MeshDisplayMode>(displayMode);
+            g_graph.MarkDirty("Preview display mode changed");
+            EvaluateGraph();
+            SaveAppSettingsSilently();
+        }
+        if (DrawPropertyBoolRow("Surface", "DisplaySurface", &settings.preview.showSurface, "Surface visibility changed"))
+        {
+            SaveAppSettingsSilently();
+        }
+        if (DrawPropertyBoolRow("Wireframe", "DisplayWireframe", &settings.preview.showWireframe, "Wireframe visibility changed"))
+        {
+            SaveAppSettingsSilently();
+        }
+        if (DrawPropertyBoolRow("Points", "DisplayPoints", &settings.preview.showPoints, "Surface points visibility changed"))
+        {
+            SaveAppSettingsSilently();
+        }
+        if (DrawPropertyBoolRow("Slice", "DisplaySlice", &settings.preview.showSlice, "Center slice visibility changed"))
+        {
+            SaveAppSettingsSilently();
+        }
+
+        ImGui::EndTable();
     }
 }
 
@@ -3391,7 +3404,7 @@ void DrawAssetExportPanel()
     ImGui::Text("%s", g_graph.Evaluation().dirty ? "needs evaluate" : "wire preview");
     ImGui::NextColumn();
     ImGui::TextUnformatted("LOD");
-    ImGui::Text("%d / %d^3", outputMesh.lod, effectiveResolution);
+    ImGui::Text("%d / output %d^3", outputMesh.lod, effectiveResolution);
     ImGui::NextColumn();
     ImGui::TextUnformatted("Textures");
     ImGui::TextUnformatted("normal / AO later");
@@ -3635,7 +3648,7 @@ void DrawUi()
         {
             rock::GraphSettings& settings = g_graph.Settings();
             const auto toggleMeshDisplayMode = [&](rock::MeshDisplayMode mode) {
-                if (g_ui.meshPreview && settings.outputMesh.displayMode == mode)
+                if (g_ui.meshPreview && settings.preview.displayMode == mode)
                 {
                     g_ui.meshPreview = false;
                     SaveAppSettingsSilently();
@@ -3643,21 +3656,21 @@ void DrawUi()
                 }
 
                 g_ui.meshPreview = true;
-                if (settings.outputMesh.displayMode != mode)
+                if (settings.preview.displayMode != mode)
                 {
-                    settings.outputMesh.displayMode = mode;
+                    settings.preview.displayMode = mode;
                     g_graph.MarkDirty("Output mesh display mode changed");
                     EvaluateGraph();
                 }
                 SaveAppSettingsSilently();
             };
 
-            const bool meshSelected = g_ui.meshPreview && settings.outputMesh.displayMode == rock::MeshDisplayMode::Mesh;
+            const bool meshSelected = g_ui.meshPreview && settings.preview.displayMode == rock::MeshDisplayMode::Mesh;
             if (ImGui::MenuItem("Mesh", nullptr, meshSelected))
             {
                 toggleMeshDisplayMode(rock::MeshDisplayMode::Mesh);
             }
-            const bool voxelSelected = g_ui.meshPreview && settings.outputMesh.displayMode == rock::MeshDisplayMode::Voxels;
+            const bool voxelSelected = g_ui.meshPreview && settings.preview.displayMode == rock::MeshDisplayMode::Voxels;
             if (ImGui::MenuItem("Voxels", nullptr, voxelSelected))
             {
                 toggleMeshDisplayMode(rock::MeshDisplayMode::Voxels);
@@ -3666,11 +3679,11 @@ void DrawUi()
             {
                 SaveAppSettingsSilently();
             }
-            if (ImGui::MenuItem("Wireframe", nullptr, &settings.outputMesh.showWireframe))
+            if (ImGui::MenuItem("Wireframe", nullptr, &settings.preview.showWireframe))
             {
                 SaveAppSettingsSilently();
             }
-            if (ImGui::MenuItem("SDF Center Slice", nullptr, &settings.outputMesh.showSlice))
+            if (ImGui::MenuItem("SDF Center Slice", nullptr, &settings.preview.showSlice))
             {
                 SaveAppSettingsSilently();
             }
@@ -3824,6 +3837,20 @@ void DrawUi()
         {
             BeginInspectorTabContent();
             DrawStatsPanel();
+            EndInspectorTabContent();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("メッシュ設定"))
+        {
+            BeginInspectorTabContent();
+            DrawMeshSettingsPanel();
+            EndInspectorTabContent();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("表示設定"))
+        {
+            BeginInspectorTabContent();
+            DrawDisplaySettingsPanel();
             EndInspectorTabContent();
             ImGui::EndTabItem();
         }

@@ -13,7 +13,8 @@ namespace rock
 {
 namespace
 {
-int EffectiveMeshResolution(const OutputMeshSettings& settings)
+template <typename Settings>
+int EffectiveMeshResolution(const Settings& settings)
 {
     const int divisor = 1 << std::clamp(settings.lod, 0, 4);
     return std::clamp(settings.resolution / divisor, 16, 96);
@@ -441,26 +442,30 @@ SdfPipeline NodeGraph::PipelineTo(NodeKind targetKind) const
 
 void NodeGraph::Evaluate()
 {
-    const int meshResolution = EffectiveMeshResolution(settings_.outputMesh);
+    const int previewMeshResolution = EffectiveMeshResolution(settings_.preview);
+    const int outputMeshResolution = EffectiveMeshResolution(settings_.outputMesh);
     const SdfPipeline previewPipeline = PreviewPipeline();
     const SdfPipeline finalPipeline = FinalPipeline();
+    GraphSettings finalSettings = settings_;
+    finalSettings.preview.displayMode = MeshDisplayMode::Mesh;
     evaluation_.requestedPreviewBackend = settings_.previewBackend;
     evaluation_.effectivePreviewBackend = ComputeBackend::Cpu;
     evaluation_.previewBackendFallback = settings_.previewBackend != ComputeBackend::Cpu;
-    evaluation_.previewSdf = BuildDenseSdfPreview(settings_, previewPipeline, meshResolution);
-    evaluation_.finalSdf = BuildDenseSdfPreview(settings_, finalPipeline, meshResolution);
+    evaluation_.previewSdf = BuildDenseSdfPreview(settings_, previewPipeline, previewMeshResolution);
+    evaluation_.finalSdf = BuildDenseSdfPreview(finalSettings, finalPipeline, outputMeshResolution);
     evaluation_.previewMesh = BuildMeshFromSdf(settings_, previewPipeline, evaluation_.previewSdf);
-    evaluation_.finalMesh = BuildMeshFromSdf(settings_, finalPipeline, evaluation_.finalSdf);
+    evaluation_.finalMesh = BuildMeshFromSdf(finalSettings, finalPipeline, evaluation_.finalSdf);
     ++evaluation_.version;
     evaluation_.dirty = false;
     evaluation_.status = std::format(
-        "{} preview [{}{}] -> {}{}{} -> mesh LOD {} / iso {:.3f} -> {} verts / {} tris",
+        "{} preview [{}{}] -> {}{}{} -> preview LOD {} / output LOD {} / iso {:.3f} -> {} verts / {} tris",
         ToString(evaluation_.previewStage),
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
         ToString(settings_.primitive.kind),
         finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", settings_.noise.amplitude, settings_.noise.frequency, settings_.noise.octaves) : "",
         finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", settings_.crack.width, settings_.crack.depth, settings_.crack.roughness) : "",
+        settings_.preview.lod,
         settings_.outputMesh.lod,
         settings_.outputMesh.isoValue,
         evaluation_.previewMesh.vertices.size(),
@@ -469,26 +474,29 @@ void NodeGraph::Evaluate()
 
 void NodeGraph::EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend requestedBackend, ComputeBackend effectiveBackend, bool fallback)
 {
-    const int meshResolution = EffectiveMeshResolution(settings_.outputMesh);
+    const int outputMeshResolution = EffectiveMeshResolution(settings_.outputMesh);
     const SdfPipeline previewPipeline = PreviewPipeline();
     const SdfPipeline finalPipeline = FinalPipeline();
+    GraphSettings finalSettings = settings_;
+    finalSettings.preview.displayMode = MeshDisplayMode::Mesh;
     evaluation_.requestedPreviewBackend = requestedBackend;
     evaluation_.effectivePreviewBackend = effectiveBackend;
     evaluation_.previewBackendFallback = fallback;
     evaluation_.previewSdf = std::move(previewSdf);
-    evaluation_.finalSdf = BuildDenseSdfPreview(settings_, finalPipeline, meshResolution);
+    evaluation_.finalSdf = BuildDenseSdfPreview(finalSettings, finalPipeline, outputMeshResolution);
     evaluation_.previewMesh = BuildMeshFromSdf(settings_, previewPipeline, evaluation_.previewSdf);
-    evaluation_.finalMesh = BuildMeshFromSdf(settings_, finalPipeline, evaluation_.finalSdf);
+    evaluation_.finalMesh = BuildMeshFromSdf(finalSettings, finalPipeline, evaluation_.finalSdf);
     ++evaluation_.version;
     evaluation_.dirty = false;
     evaluation_.status = std::format(
-        "{} preview [{}{}] -> {}{}{} -> mesh LOD {} / iso {:.3f} -> {} verts / {} tris",
+        "{} preview [{}{}] -> {}{}{} -> preview LOD {} / output LOD {} / iso {:.3f} -> {} verts / {} tris",
         ToString(evaluation_.previewStage),
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
         ToString(settings_.primitive.kind),
         finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", settings_.noise.amplitude, settings_.noise.frequency, settings_.noise.octaves) : "",
         finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", settings_.crack.width, settings_.crack.depth, settings_.crack.roughness) : "",
+        settings_.preview.lod,
         settings_.outputMesh.lod,
         settings_.outputMesh.isoValue,
         evaluation_.previewMesh.vertices.size(),

@@ -105,9 +105,15 @@ struct CrackSettings
 
 struct OutputMeshSettings
 {
-    int resolution = 48;
+    int resolution = 96;
     int lod = 0;
     float isoValue = 0.0f;
+};
+
+struct PreviewSettings
+{
+    int resolution = 48;
+    int lod = 0;
     MeshDisplayMode displayMode = MeshDisplayMode::Mesh;
     bool showSurface = true;
     bool showWireframe = true;
@@ -121,6 +127,7 @@ struct GraphSettings
     NoiseSettings noise;
     CrackSettings crack;
     OutputMeshSettings outputMesh;
+    PreviewSettings preview;
     ComputeBackend previewBackend = ComputeBackend::Cpu;
 };
 

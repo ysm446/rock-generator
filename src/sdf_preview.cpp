@@ -442,7 +442,7 @@ void BuildVoxelFaceGeometry(SdfPreviewStats& stats, const std::vector<float>& sd
 
 void BuildPreviewGeometry(SdfPreviewStats& stats, const std::vector<float>& sdfValues, const GraphSettings& settings)
 {
-    if (settings.outputMesh.displayMode == MeshDisplayMode::Voxels)
+    if (settings.preview.displayMode == MeshDisplayMode::Voxels)
     {
         BuildVoxelFaceGeometry(stats, sdfValues);
     }
