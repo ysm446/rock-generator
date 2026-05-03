@@ -77,6 +77,8 @@ std::array<FrameContext, kFrameCount> g_frameContexts;
 std::array<ComPtr<ID3D12Resource>, kFrameCount> g_renderTargets;
 std::array<bool, kSrvDescriptorCount> g_srvDescriptorUsed{};
 ed::EditorContext* g_nodeEditor = nullptr;
+bool g_nodeEditorFrameActive = false;
+bool g_skipNodeMoveUndoThisFrame = false;
 bool g_nodePositionsInitialized = false;
 bool g_nodeGraphNavigatedToContent = false;
 bool g_layoutSplitterActive = false;
@@ -106,6 +108,22 @@ struct NodeClipboard
 };
 
 NodeClipboard g_nodeClipboard;
+
+struct GraphEditSnapshot
+{
+    std::vector<rock::Node> nodes;
+    std::vector<rock::Link> links;
+    std::vector<std::pair<rock::GraphId, ImVec2>> nodePositions;
+    std::vector<rock::GraphId> selectedNodeIds;
+    rock::GraphId selectedNodeId = 0;
+    rock::GraphId previewNodeId = 0;
+    rock::PreviewStage previewStage = rock::PreviewStage::Output;
+};
+
+std::vector<GraphEditSnapshot> g_undoStack;
+std::vector<GraphEditSnapshot> g_redoStack;
+std::optional<GraphEditSnapshot> g_pendingPropertyEditUndo;
+std::optional<GraphEditSnapshot> g_pendingNodeMoveUndo;
 
 struct UiState
 {
@@ -1000,8 +1018,212 @@ void ResetNodeEditorViewToDefault()
     }
 }
 
+std::vector<std::pair<rock::GraphId, ImVec2>> CachedNodePositions()
+{
+    std::vector<std::pair<rock::GraphId, ImVec2>> positions;
+    positions.reserve(g_graph.Nodes().size());
+    for (const rock::Node& node : g_graph.Nodes())
+    {
+        ImVec2 position = InitialNodePosition(node.kind);
+        const auto cached = std::ranges::find_if(g_nodePositionCache, [&](const auto& entry) {
+            return entry.first == node.id;
+        });
+        if (cached != g_nodePositionCache.end())
+        {
+            position = cached->second;
+        }
+        const auto pending = std::ranges::find_if(g_pendingNodePositions, [&](const auto& entry) {
+            return entry.first == node.id;
+        });
+        if (pending != g_pendingNodePositions.end())
+        {
+            position = pending->second;
+        }
+        positions.push_back({node.id, position});
+    }
+    return positions;
+}
+
+std::vector<rock::GraphId> CurrentSelectedNodeIds()
+{
+    if (g_nodeEditor == nullptr)
+    {
+        return g_pendingSelectedNodeIds.empty() && g_selectedNodeId != 0
+            ? std::vector<rock::GraphId>{g_selectedNodeId}
+            : g_pendingSelectedNodeIds;
+    }
+
+    if (!g_nodeEditorFrameActive)
+    {
+        ed::SetCurrentEditor(g_nodeEditor);
+    }
+    std::vector<ed::NodeId> selectedNodes(g_graph.Nodes().size());
+    const int selectedCount = ed::GetSelectedNodes(selectedNodes.data(), static_cast<int>(selectedNodes.size()));
+    if (!g_nodeEditorFrameActive)
+    {
+        ed::SetCurrentEditor(nullptr);
+    }
+
+    std::vector<rock::GraphId> selectedNodeIds;
+    selectedNodeIds.reserve(static_cast<size_t>(selectedCount));
+    for (int index = 0; index < selectedCount; ++index)
+    {
+        const rock::GraphId nodeId = static_cast<rock::GraphId>(selectedNodes[static_cast<size_t>(index)].Get());
+        if (g_graph.FindNode(nodeId) != nullptr)
+        {
+            selectedNodeIds.push_back(nodeId);
+        }
+    }
+    if (selectedNodeIds.empty() && g_graph.FindNode(g_selectedNodeId) != nullptr)
+    {
+        selectedNodeIds.push_back(g_selectedNodeId);
+    }
+    return selectedNodeIds;
+}
+
+GraphEditSnapshot CaptureGraphEditSnapshot()
+{
+    GraphEditSnapshot snapshot;
+    snapshot.nodes = g_graph.Nodes();
+    snapshot.links = g_graph.Links();
+    snapshot.nodePositions = CachedNodePositions();
+    snapshot.selectedNodeIds = CurrentSelectedNodeIds();
+    snapshot.selectedNodeId = snapshot.selectedNodeIds.empty() ? g_selectedNodeId : snapshot.selectedNodeIds.front();
+    snapshot.previewNodeId = g_graph.Evaluation().previewNodeId;
+    snapshot.previewStage = g_graph.Preview();
+    return snapshot;
+}
+
+GraphEditSnapshot CaptureGraphEditSnapshotWithPositions(const std::vector<std::pair<rock::GraphId, ImVec2>>& positions)
+{
+    GraphEditSnapshot snapshot = CaptureGraphEditSnapshot();
+    snapshot.nodePositions = positions;
+    return snapshot;
+}
+
+bool NodePositionsChanged(
+    const std::vector<std::pair<rock::GraphId, ImVec2>>& a,
+    const std::vector<std::pair<rock::GraphId, ImVec2>>& b)
+{
+    if (a.size() != b.size())
+    {
+        return true;
+    }
+    for (const auto& [nodeId, position] : a)
+    {
+        const auto it = std::ranges::find_if(b, [nodeId](const auto& entry) {
+            return entry.first == nodeId;
+        });
+        if (it == b.end())
+        {
+            return true;
+        }
+        if (std::abs(position.x - it->second.x) > 0.5f || std::abs(position.y - it->second.y) > 0.5f)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void CommitUndoSnapshot(GraphEditSnapshot snapshot)
+{
+    constexpr size_t kMaxUndoSnapshots = 64;
+    g_undoStack.push_back(std::move(snapshot));
+    if (g_undoStack.size() > kMaxUndoSnapshots)
+    {
+        g_undoStack.erase(g_undoStack.begin());
+    }
+    g_redoStack.clear();
+}
+
+void PushUndoSnapshot()
+{
+    CommitUndoSnapshot(CaptureGraphEditSnapshot());
+}
+
+void BeginPropertyUndoEdit()
+{
+    if (!g_pendingPropertyEditUndo)
+    {
+        g_pendingPropertyEditUndo = CaptureGraphEditSnapshot();
+    }
+}
+
+void CommitPropertyUndoEdit()
+{
+    if (!g_pendingPropertyEditUndo)
+    {
+        return;
+    }
+
+    CommitUndoSnapshot(std::move(*g_pendingPropertyEditUndo));
+    g_pendingPropertyEditUndo.reset();
+}
+
+void ClearUndoHistory()
+{
+    g_undoStack.clear();
+    g_redoStack.clear();
+    g_pendingPropertyEditUndo.reset();
+    g_pendingNodeMoveUndo.reset();
+}
+
+void ApplyGraphEditSnapshot(const GraphEditSnapshot& snapshot)
+{
+    g_skipNodeMoveUndoThisFrame = true;
+    g_graph.ReplaceNodes(snapshot.nodes);
+    g_graph.ReplaceLinks(snapshot.links);
+    g_graph.SetPreviewStage(snapshot.previewStage);
+    if (g_graph.FindNode(snapshot.previewNodeId) != nullptr)
+    {
+        g_graph.SetPreviewNode(snapshot.previewNodeId);
+    }
+    else if (g_graph.FindNode(snapshot.selectedNodeId) != nullptr)
+    {
+        g_graph.SetPreviewNode(snapshot.selectedNodeId);
+    }
+
+    g_pendingNodePositions = snapshot.nodePositions;
+    g_nodePositionCache = snapshot.nodePositions;
+    g_pendingSelectedNodeIds = snapshot.selectedNodeIds;
+    g_selectedNodeId = snapshot.selectedNodeId;
+    g_nodePositionsInitialized = false;
+    g_lastFinalOutputNodeId = 0;
+    EvaluateGraph();
+}
+
+void UndoGraphEdit()
+{
+    if (g_undoStack.empty())
+    {
+        return;
+    }
+
+    GraphEditSnapshot undoSnapshot = std::move(g_undoStack.back());
+    g_undoStack.pop_back();
+    g_redoStack.push_back(CaptureGraphEditSnapshot());
+    ApplyGraphEditSnapshot(undoSnapshot);
+    g_projectStatus = "Undo";
+}
+
+void RedoGraphEdit()
+{
+    if (g_redoStack.empty())
+    {
+        return;
+    }
+
+    GraphEditSnapshot redoSnapshot = std::move(g_redoStack.back());
+    g_redoStack.pop_back();
+    g_undoStack.push_back(CaptureGraphEditSnapshot());
+    ApplyGraphEditSnapshot(redoSnapshot);
+    g_projectStatus = "Redo";
+}
+
 void NewProject()
 {
+    ClearUndoHistory();
     g_graph = rock::NodeGraph::CreateDefaultRockGraph();
     g_projectPath.clear();
     UpdateWindowTitle();
@@ -1384,6 +1606,7 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         UpdateWindowTitle();
         AddRecentProjectPath(path);
         SaveAppSettingsSilently();
+        ClearUndoHistory();
         g_projectStatus = "Loaded " + PathToUtf8(path);
         EvaluateGraph();
         return true;
@@ -3199,6 +3422,8 @@ void PasteNodesFromClipboard(const ImVec2& pasteCenter)
         return;
     }
 
+    PushUndoSnapshot();
+    g_skipNodeMoveUndoThisFrame = true;
     ImVec2 minPosition = g_nodeClipboard.nodes.front().position;
     ImVec2 maxPosition = g_nodeClipboard.nodes.front().position;
     for (const ClipboardNode& clipboardNode : g_nodeClipboard.nodes)
@@ -3271,6 +3496,7 @@ void DrawNodeGraph()
 {
     static ImVec2 addNodePosition(0.0f, 0.0f);
     ed::SetCurrentEditor(g_nodeEditor);
+    g_nodeEditorFrameActive = true;
     const ImVec2 canvasMin = ImGui::GetCursorScreenPos();
     const ImVec2 canvasMax(canvasMin.x + ImGui::GetContentRegionAvail().x, canvasMin.y + ImGui::GetContentRegionAvail().y);
     ed::PushStyleColor(ed::StyleColor_Bg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -3362,6 +3588,7 @@ void DrawNodeGraph()
             {
                 if (ed::AcceptNewItem(ImVec4(0.52f, 0.70f, 0.59f, 1.0f), 3.0f))
                 {
+                    PushUndoSnapshot();
                     if (g_graph.CreateLink(startPin, endPin))
                     {
                         EvaluateGraph();
@@ -3379,12 +3606,20 @@ void DrawNodeGraph()
     if (ed::BeginDelete())
     {
         bool graphChanged = false;
+        std::optional<GraphEditSnapshot> deleteUndoSnapshot;
+        const auto captureDeleteUndo = [&]() {
+            if (!deleteUndoSnapshot)
+            {
+                deleteUndoSnapshot = CaptureGraphEditSnapshot();
+            }
+        };
         ed::LinkId deletedLinkId;
         while (ed::QueryDeletedLink(&deletedLinkId))
         {
             if (ed::AcceptDeletedItem())
             {
                 const int linkId = ToGraphId(deletedLinkId.Get());
+                captureDeleteUndo();
                 if (g_graph.DeleteLink(linkId))
                 {
                     graphChanged = true;
@@ -3397,6 +3632,7 @@ void DrawNodeGraph()
             if (ed::AcceptDeletedItem())
             {
                 const int nodeId = ToGraphId(deletedNodeId.Get());
+                captureDeleteUndo();
                 if (g_graph.DeleteNode(nodeId))
                 {
                     graphChanged = true;
@@ -3416,6 +3652,11 @@ void DrawNodeGraph()
         }
         if (graphChanged)
         {
+            if (deleteUndoSnapshot)
+            {
+                CommitUndoSnapshot(std::move(*deleteUndoSnapshot));
+            }
+            g_skipNodeMoveUndoThisFrame = true;
             EvaluateGraph();
         }
     }
@@ -3437,6 +3678,8 @@ void DrawNodeGraph()
         const auto addNodeMenuItem = [&](rock::NodeKind kind) {
             if (ImGui::MenuItem(rock::ToString(kind).data()))
             {
+                PushUndoSnapshot();
+                g_skipNodeMoveUndoThisFrame = true;
                 const rock::GraphId nodeId = g_graph.CreateNode(kind);
                 g_pendingNodePositions.push_back({nodeId, addNodePosition});
                 g_pendingSelectedNodeIds = {nodeId};
@@ -3479,13 +3722,33 @@ void DrawNodeGraph()
     }
 
     ed::End();
-    g_nodePositionCache.clear();
+    std::vector<std::pair<rock::GraphId, ImVec2>> currentNodePositions;
+    currentNodePositions.reserve(g_graph.Nodes().size());
     for (const rock::Node& node : g_graph.Nodes())
     {
         const ImVec2 position = ed::GetNodePosition(ed::NodeId(node.id));
-        g_nodePositionCache.push_back({node.id, position});
+        currentNodePositions.push_back({node.id, position});
     }
+    if (!g_skipNodeMoveUndoThisFrame && g_nodePositionsInitialized && !g_nodePositionCache.empty() && NodePositionsChanged(currentNodePositions, g_nodePositionCache))
+    {
+        if (!g_pendingNodeMoveUndo)
+        {
+            g_pendingNodeMoveUndo = CaptureGraphEditSnapshotWithPositions(g_nodePositionCache);
+        }
+    }
+    if (g_pendingNodeMoveUndo && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
+    {
+        if (NodePositionsChanged(currentNodePositions, g_pendingNodeMoveUndo->nodePositions))
+        {
+            CommitUndoSnapshot(std::move(*g_pendingNodeMoveUndo));
+            g_projectStatus = "Node moved";
+        }
+        g_pendingNodeMoveUndo.reset();
+    }
+    g_nodePositionCache = std::move(currentNodePositions);
+    g_skipNodeMoveUndoThisFrame = false;
     ed::PopStyleColor(2);
+    g_nodeEditorFrameActive = false;
     ed::SetCurrentEditor(nullptr);
 }
 
@@ -3529,7 +3792,7 @@ bool DrawResetToDefaultButton(const char* id)
     return pressed;
 }
 
-bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, float defaultValue, const char* dirtyReason)
+bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, float defaultValue, const char* dirtyReason, bool recordUndo = true)
 {
     bool editEnded = false;
     ImGui::TableNextRow();
@@ -3551,6 +3814,10 @@ bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float
     {
         g_graph.MarkDirty(dirtyReason);
     }
+    if (recordUndo && ImGui::IsItemActivated())
+    {
+        BeginPropertyUndoEdit();
+    }
     editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
 
     ImGui::SameLine();
@@ -3560,18 +3827,30 @@ bool DrawPropertyFloatRow(const char* label, const char* id, float* value, float
         *value = std::clamp(*value, minValue, maxValue);
         g_graph.MarkDirty(dirtyReason);
     }
+    if (recordUndo && ImGui::IsItemActivated())
+    {
+        BeginPropertyUndoEdit();
+    }
     editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
     if (DrawResetToDefaultButton("reset"))
     {
+        if (recordUndo)
+        {
+            PushUndoSnapshot();
+        }
         *value = std::clamp(defaultValue, minValue, maxValue);
         g_graph.MarkDirty(dirtyReason);
         editEnded = true;
     }
     ImGui::PopID();
+    if (recordUndo && editEnded)
+    {
+        CommitPropertyUndoEdit();
+    }
     return editEnded;
 }
 
-bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minValue, int maxValue, int defaultValue, const char* dirtyReason)
+bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minValue, int maxValue, int defaultValue, const char* dirtyReason, bool recordUndo = true)
 {
     bool editEnded = false;
     ImGui::TableNextRow();
@@ -3593,6 +3872,10 @@ bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minVa
     {
         g_graph.MarkDirty(dirtyReason);
     }
+    if (recordUndo && ImGui::IsItemActivated())
+    {
+        BeginPropertyUndoEdit();
+    }
     editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
 
     ImGui::SameLine();
@@ -3602,14 +3885,26 @@ bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minVa
         *value = std::clamp(*value, minValue, maxValue);
         g_graph.MarkDirty(dirtyReason);
     }
+    if (recordUndo && ImGui::IsItemActivated())
+    {
+        BeginPropertyUndoEdit();
+    }
     editEnded = editEnded || ImGui::IsItemDeactivatedAfterEdit();
     if (DrawResetToDefaultButton("reset"))
     {
+        if (recordUndo)
+        {
+            PushUndoSnapshot();
+        }
         *value = std::clamp(defaultValue, minValue, maxValue);
         g_graph.MarkDirty(dirtyReason);
         editEnded = true;
     }
     ImGui::PopID();
+    if (recordUndo && editEnded)
+    {
+        CommitPropertyUndoEdit();
+    }
     return editEnded;
 }
 
@@ -3721,6 +4016,7 @@ void DrawPropertiesPanel()
         int primitive = static_cast<int>(editableNode->primitive.kind);
         if (DrawPropertyComboRow("Primitive", "Primitive", &primitive, "Sphere\0Box\0Capsule\0Ellipsoid\0Rock Blob\0"))
         {
+            PushUndoSnapshot();
             editableNode->primitive.kind = static_cast<rock::PrimitiveKind>(primitive);
             g_graph.MarkDirty("Primitive changed");
             EvaluateGraph();
@@ -3825,12 +4121,12 @@ void DrawDisplaySettingsPanel()
         {
             SaveAppSettingsSilently();
         }
-        if (DrawPropertyIntRow("Resolution", "DisplayPreviewResolution", &settings.preview.resolution, 16, 96, rock::PreviewSettings{}.resolution, "Preview resolution changed"))
+        if (DrawPropertyIntRow("Resolution", "DisplayPreviewResolution", &settings.preview.resolution, 16, 96, rock::PreviewSettings{}.resolution, "Preview resolution changed", false))
         {
             EvaluateGraph();
             SaveAppSettingsSilently();
         }
-        if (DrawPropertyIntRow("LOD", "DisplayPreviewLod", &settings.preview.lod, 0, 4, rock::PreviewSettings{}.lod, "Preview LOD changed"))
+        if (DrawPropertyIntRow("LOD", "DisplayPreviewLod", &settings.preview.lod, 0, 4, rock::PreviewSettings{}.lod, "Preview LOD changed", false))
         {
             EvaluateGraph();
             SaveAppSettingsSilently();
@@ -4130,6 +4426,21 @@ void DrawUi()
     {
         SaveCurrentProject();
     }
+    if (io.KeyCtrl && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Z, false))
+    {
+        if (io.KeyShift)
+        {
+            RedoGraphEdit();
+        }
+        else
+        {
+            UndoGraphEdit();
+        }
+    }
+    if (io.KeyCtrl && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Y, false))
+    {
+        RedoGraphEdit();
+    }
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 8.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 7.0f));
@@ -4210,8 +4521,14 @@ void DrawUi()
         }
         if (ImGui::BeginMenu("編集"))
         {
-            ImGui::MenuItem("元に戻す", "Ctrl+Z", false, false);
-            ImGui::MenuItem("やり直し", "Ctrl+Y", false, false);
+            if (ImGui::MenuItem("元に戻す", "Ctrl+Z", false, !g_undoStack.empty()))
+            {
+                UndoGraphEdit();
+            }
+            if (ImGui::MenuItem("やり直し", "Ctrl+Y", false, !g_redoStack.empty()))
+            {
+                RedoGraphEdit();
+            }
             ImGui::Separator();
             ImGui::MenuItem("コピー", "Ctrl+C", false, false);
             ImGui::MenuItem("貼り付け", "Ctrl+V", false, false);
