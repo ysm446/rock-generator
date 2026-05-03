@@ -285,8 +285,8 @@ UiTheme UiThemeManager::MakeBuiltInLithicDark()
     theme.appColors = {
         {"viewportBg", ImVec4(0.08f, 0.09f, 0.09f, 1.0f)},
         {"viewportGrid", ImVec4(0.24f, 0.27f, 0.25f, 0.35f)},
-        {"surfaceFill", ImVec4(0.38f, 0.48f, 0.40f, 0.29f)},
-        {"surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)},
+        {"surfaceFill", ImVec4(0.42f, 0.42f, 0.42f, 1.0f)},
+        {"surfaceWire", ImVec4(0.34f, 0.34f, 0.34f, 0.70f)},
         {"surfacePoint", ImVec4(0.78f, 0.84f, 0.72f, 0.82f)},
         {"accentText", ImVec4(0.82f, 0.87f, 0.80f, 1.0f)},
         {"mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)}

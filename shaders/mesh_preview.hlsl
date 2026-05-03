@@ -53,13 +53,13 @@ float4 PSSurface(VSOut i) : SV_TARGET
     float fres = pow(saturate(1.0 - abs(dot(n, V))), 2.0);
     float h = saturate(i.worldPos.y * 0.5 + 0.5);
     float3 col = float3(
-        (95.0 + diff * 70.0 + fres * 36.0 + h * 14.0) / 255.0,
-        (104.0 + diff * 82.0 + fres * 28.0 + h * 12.0) / 255.0,
-        (94.0 + diff * 62.0 + fres * 20.0) / 255.0);
-    return float4(col, 0.90);
+        (92.0 + diff * 76.0 + fres * 26.0 + h * 10.0) / 255.0,
+        (92.0 + diff * 76.0 + fres * 26.0 + h * 10.0) / 255.0,
+        (92.0 + diff * 76.0 + fres * 26.0 + h * 10.0) / 255.0);
+    return float4(col, 1.0);
 }
 
 float4 PSEdge(VSOut i) : SV_TARGET
 {
-    return float4(0.80, 0.84, 0.75, 0.80);
+    return float4(0.34, 0.34, 0.34, 0.86);
 }

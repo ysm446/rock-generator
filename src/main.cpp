@@ -574,6 +574,21 @@ void CleanupD3D()
         g_gpuRaymarchPreview.uavAllocated = false;
     }
     g_gpuRaymarchPreview.texture.Reset();
+    if (g_gpuMeshPreview.srvAllocated)
+    {
+        FreeSrvDescriptor(nullptr, g_gpuMeshPreview.srvCpu, g_gpuMeshPreview.srvGpu);
+        g_gpuMeshPreview.srvAllocated = false;
+    }
+    g_gpuMeshPreview.colorTarget.Reset();
+    g_gpuMeshPreview.depthTarget.Reset();
+    g_gpuMeshPreview.vertexBuffer.Reset();
+    g_gpuMeshPreview.indexBuffer.Reset();
+    g_gpuMeshPreview.edgeIndexBuffer.Reset();
+    g_meshPreviewSurfacePso.Reset();
+    g_meshPreviewWirePso.Reset();
+    g_meshPreviewRootSignature.Reset();
+    g_meshPreviewRtvHeap.Reset();
+    g_meshPreviewDsvHeap.Reset();
     if (g_fenceEvent)
     {
         CloseHandle(g_fenceEvent);
@@ -723,6 +738,7 @@ bool SaveAppSettings(std::string* error = nullptr)
             {"mesh", g_ui.meshPreview},
             {"raymarch", g_ui.sdfPreview},
             {"meshDisplayMode", static_cast<int>(settings.outputMesh.displayMode)},
+            {"meshWireframe", settings.outputMesh.showWireframe},
             {"centerSlice", settings.outputMesh.showSlice},
         };
         root["layout"] = {
@@ -812,6 +828,7 @@ bool LoadAppSettings(std::string* error = nullptr)
         g_ui.meshPreview = visibilityJson.value("mesh", g_ui.meshPreview);
         g_ui.sdfPreview = visibilityJson.value("raymarch", g_ui.sdfPreview);
         settings.outputMesh.displayMode = static_cast<rock::MeshDisplayMode>(std::clamp(visibilityJson.value("meshDisplayMode", static_cast<int>(settings.outputMesh.displayMode)), 0, 1));
+        settings.outputMesh.showWireframe = visibilityJson.value("meshWireframe", settings.outputMesh.showWireframe);
         settings.outputMesh.showSlice = visibilityJson.value("centerSlice", settings.outputMesh.showSlice);
 
         const nlohmann::json layoutJson = root.value("layout", nlohmann::json::object());
@@ -898,7 +915,6 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
         root["format"] = "rock_generator_project";
         root["formatVersion"] = 1;
         root["appVersion"] = ROCK_GENERATOR_VERSION_STRING;
-        root["theme"] = g_themeManager.CurrentThemeId();
         root["selectedNodeId"] = g_selectedNodeId;
         root["selectedNodeIds"] = nlohmann::json::array();
         root["previewStage"] = static_cast<int>(g_graph.Preview());
@@ -1136,12 +1152,6 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         }
         g_nodePositionsInitialized = false;
         g_nodeGraphNavigatedToContent = false;
-
-        const std::string themeId = root.value("theme", std::string());
-        if (!themeId.empty())
-        {
-            g_themeManager.ApplyTheme(themeId);
-        }
 
         g_projectPath = path;
         UpdateWindowTitle();
@@ -1395,8 +1405,10 @@ bool EnsureMeshPreviewPipeline(std::string* error)
 
     psoDesc.PS = {psEdgeBlob->GetBufferPointer(), psEdgeBlob->GetBufferSize()};
     psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
-    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.RasterizerState.DepthBias = -64;
+    psoDesc.DepthStencilState.DepthEnable = TRUE;
     psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     hr = g_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_meshPreviewWirePso));
     if (FAILED(hr)) { if (error) *error = "Create mesh wire PSO failed"; return false; }
 
@@ -2245,7 +2257,7 @@ void DrawSurfaceWirePreview(ImDrawList* drawList, const ImVec2& min, const ImVec
             continue;
         }
 
-        drawList->AddLine(a, b, ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 1.0f);
+        drawList->AddLine(a, b, ThemeColor("surfaceWire", ImVec4(0.34f, 0.34f, 0.34f, 0.70f)), 1.0f);
     }
 }
 
@@ -2361,11 +2373,11 @@ void DrawMeshPreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max,
 
         if (showSurface)
         {
-            drawList->AddTriangleFilled(a, b, c, ThemeColor("surfaceFill", ImVec4(0.38f, 0.48f, 0.40f, 0.29f)));
+            drawList->AddTriangleFilled(a, b, c, ThemeColor("surfaceFill", ImVec4(0.42f, 0.42f, 0.42f, 1.0f)));
         }
         if (showWireframe)
         {
-            drawList->AddTriangle(a, b, c, ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 0.8f);
+            drawList->AddTriangle(a, b, c, ThemeColor("surfaceWire", ImVec4(0.34f, 0.34f, 0.34f, 0.70f)), 0.8f);
         }
     }
 }
@@ -2396,7 +2408,7 @@ void DrawMeshEdgePreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& 
         {
             continue;
         }
-        drawList->AddLine(a, b, ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 0.9f);
+        drawList->AddLine(a, b, ThemeColor("surfaceWire", ImVec4(0.34f, 0.34f, 0.34f, 0.70f)), 0.9f);
     }
 }
 
@@ -2434,7 +2446,10 @@ bool RenderGpuMeshPreview(const ImVec2& min, const ImVec2& max, bool showSurface
             UpdateMeshPreviewBuffers(mesh);
             g_gpuMeshPreview.graphVersion = currentVersion;
         }
-        if (g_gpuMeshPreview.vertexCount == 0) return true;
+        if (g_gpuMeshPreview.vertexCount == 0)
+        {
+            return false;
+        }
 
         ComPtr<ID3D12CommandAllocator> allocator;
         ComPtr<ID3D12GraphicsCommandList> commandList;
@@ -2608,7 +2623,7 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     }};
 
     const float centerDepth = ProjectWorldToScreen(0.0f, 0.0f, 0.0f, center, scale).depth;
-    const ImVec4 wireBase = g_themeManager.AppColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f));
+    const ImVec4 wireBase = g_themeManager.AppColor("surfaceWire", ImVec4(0.34f, 0.34f, 0.34f, 0.70f));
     drawList->PushClipRect(min, max, true);
     for (const auto& edge : edges)
     {
@@ -3648,6 +3663,10 @@ void DrawUi()
                 toggleMeshDisplayMode(rock::MeshDisplayMode::Voxels);
             }
             if (ImGui::MenuItem("Raymarch", nullptr, &g_ui.sdfPreview))
+            {
+                SaveAppSettingsSilently();
+            }
+            if (ImGui::MenuItem("Wireframe", nullptr, &settings.outputMesh.showWireframe))
             {
                 SaveAppSettingsSilently();
             }

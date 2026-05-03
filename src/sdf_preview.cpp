@@ -211,8 +211,8 @@ void BuildSurfaceNetGeometry(SdfPreviewStats& stats, const std::vector<float>& s
         return;
     }
 
-    constexpr size_t kMaxSurfaceSegments = 12000;
-    constexpr size_t kMaxSurfaceTriangles = 12000;
+    constexpr size_t kMaxSurfaceSegments = 60000;
+    constexpr size_t kMaxSurfaceTriangles = 60000;
     constexpr std::array<std::array<int, 2>, 12> edges{{
         {{0, 1}}, {{1, 3}}, {{3, 2}}, {{2, 0}},
         {{4, 5}}, {{5, 7}}, {{7, 6}}, {{6, 4}},
@@ -368,8 +368,8 @@ void BuildSurfaceNetGeometry(SdfPreviewStats& stats, const std::vector<float>& s
 
 void BuildVoxelFaceGeometry(SdfPreviewStats& stats, const std::vector<float>& sdfValues)
 {
-    constexpr size_t kMaxSurfaceSegments = 4200;
-    constexpr size_t kMaxSurfaceTriangles = 3600;
+    constexpr size_t kMaxSurfaceSegments = 60000;
+    constexpr size_t kMaxSurfaceTriangles = 60000;
 
     const auto addSegment = [&](Vec3 a, Vec3 b) {
         if (stats.surfaceSegments.size() < kMaxSurfaceSegments)

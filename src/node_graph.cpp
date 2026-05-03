@@ -65,7 +65,28 @@ void AccumulateNormal(MeshVertex& vertex, float nx, float ny, float nz)
     vertex.nz += nz;
 }
 
-MeshData BuildMeshFromSdf(const SdfPreviewStats& sdf)
+void ApplySdfGradientNormals(const GraphSettings& settings, const SdfPipeline& pipeline, const SdfPreviewStats& sdf, MeshData& mesh)
+{
+    const float e = std::max(sdf.voxelSize * 0.35f, 0.001f);
+    for (MeshVertex& vertex : mesh.vertices)
+    {
+        const float dx = EvaluateSdfAt(settings, pipeline, vertex.x + e, vertex.y, vertex.z) -
+            EvaluateSdfAt(settings, pipeline, vertex.x - e, vertex.y, vertex.z);
+        const float dy = EvaluateSdfAt(settings, pipeline, vertex.x, vertex.y + e, vertex.z) -
+            EvaluateSdfAt(settings, pipeline, vertex.x, vertex.y - e, vertex.z);
+        const float dz = EvaluateSdfAt(settings, pipeline, vertex.x, vertex.y, vertex.z + e) -
+            EvaluateSdfAt(settings, pipeline, vertex.x, vertex.y, vertex.z - e);
+        const float length = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (length > 0.000001f)
+        {
+            vertex.nx = dx / length;
+            vertex.ny = dy / length;
+            vertex.nz = dz / length;
+        }
+    }
+}
+
+MeshData BuildMeshFromSdf(const GraphSettings& settings, const SdfPipeline& pipeline, const SdfPreviewStats& sdf)
 {
     MeshData mesh;
     mesh.vertices.reserve(sdf.surfaceTriangles.size());
@@ -138,6 +159,8 @@ MeshData BuildMeshFromSdf(const SdfPreviewStats& sdf)
             vertex.nz = 0.0f;
         }
     }
+
+    ApplySdfGradientNormals(settings, pipeline, sdf, mesh);
 
     return mesh;
 }
@@ -426,8 +449,8 @@ void NodeGraph::Evaluate()
     evaluation_.previewBackendFallback = settings_.previewBackend != ComputeBackend::Cpu;
     evaluation_.previewSdf = BuildDenseSdfPreview(settings_, previewPipeline, meshResolution);
     evaluation_.finalSdf = BuildDenseSdfPreview(settings_, finalPipeline, meshResolution);
-    evaluation_.previewMesh = BuildMeshFromSdf(evaluation_.previewSdf);
-    evaluation_.finalMesh = BuildMeshFromSdf(evaluation_.finalSdf);
+    evaluation_.previewMesh = BuildMeshFromSdf(settings_, previewPipeline, evaluation_.previewSdf);
+    evaluation_.finalMesh = BuildMeshFromSdf(settings_, finalPipeline, evaluation_.finalSdf);
     ++evaluation_.version;
     evaluation_.dirty = false;
     evaluation_.status = std::format(
@@ -447,14 +470,15 @@ void NodeGraph::Evaluate()
 void NodeGraph::EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend requestedBackend, ComputeBackend effectiveBackend, bool fallback)
 {
     const int meshResolution = EffectiveMeshResolution(settings_.outputMesh);
+    const SdfPipeline previewPipeline = PreviewPipeline();
     const SdfPipeline finalPipeline = FinalPipeline();
     evaluation_.requestedPreviewBackend = requestedBackend;
     evaluation_.effectivePreviewBackend = effectiveBackend;
     evaluation_.previewBackendFallback = fallback;
     evaluation_.previewSdf = std::move(previewSdf);
     evaluation_.finalSdf = BuildDenseSdfPreview(settings_, finalPipeline, meshResolution);
-    evaluation_.previewMesh = BuildMeshFromSdf(evaluation_.previewSdf);
-    evaluation_.finalMesh = BuildMeshFromSdf(evaluation_.finalSdf);
+    evaluation_.previewMesh = BuildMeshFromSdf(settings_, previewPipeline, evaluation_.previewSdf);
+    evaluation_.finalMesh = BuildMeshFromSdf(settings_, finalPipeline, evaluation_.finalSdf);
     ++evaluation_.version;
     evaluation_.dirty = false;
     evaluation_.status = std::format(

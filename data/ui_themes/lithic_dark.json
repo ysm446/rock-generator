@@ -36,8 +36,8 @@
   "appColors": {
     "viewportBg": [0.08, 0.09, 0.09, 1.0],
     "viewportGrid": [0.24, 0.27, 0.25, 0.35],
-    "surfaceFill": [0.38, 0.48, 0.40, 0.29],
-    "surfaceWire": [0.80, 0.84, 0.75, 0.53],
+    "surfaceFill": [0.42, 0.42, 0.42, 1.0],
+    "surfaceWire": [0.34, 0.34, 0.34, 0.70],
     "surfacePoint": [0.78, 0.84, 0.72, 0.82],
     "accentText": [0.82, 0.87, 0.80, 1.0],
     "mutedText": [0.54, 0.59, 0.56, 1.0]
