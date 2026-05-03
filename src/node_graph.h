@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -68,30 +69,6 @@ struct Pin
     std::string label;
 };
 
-struct OutputMeshSettings
-{
-    int resolution = 96;
-    int lod = 0;
-    float isoValue = 0.0f;
-};
-
-struct Node
-{
-    GraphId id = 0;
-    NodeKind kind = NodeKind::PrimitiveSdf;
-    std::string title;
-    std::vector<Pin> inputs;
-    std::vector<Pin> outputs;
-    OutputMeshSettings outputMesh;
-};
-
-struct Link
-{
-    GraphId id = 0;
-    GraphId startPin = 0;
-    GraphId endPin = 0;
-};
-
 struct PrimitiveSettings
 {
     PrimitiveKind kind = PrimitiveKind::RockBlob;
@@ -111,6 +88,33 @@ struct CrackSettings
     float roughness = 0.65f;
 };
 
+struct OutputMeshSettings
+{
+    int resolution = 96;
+    int lod = 0;
+    float isoValue = 0.0f;
+};
+
+struct Node
+{
+    GraphId id = 0;
+    NodeKind kind = NodeKind::PrimitiveSdf;
+    std::string title;
+    std::vector<Pin> inputs;
+    std::vector<Pin> outputs;
+    PrimitiveSettings primitive;
+    NoiseSettings noise;
+    CrackSettings crack;
+    OutputMeshSettings outputMesh;
+};
+
+struct Link
+{
+    GraphId id = 0;
+    GraphId startPin = 0;
+    GraphId endPin = 0;
+};
+
 struct PreviewSettings
 {
     int resolution = 48;
@@ -120,13 +124,12 @@ struct PreviewSettings
     bool showWireframe = true;
     bool showPoints = false;
     bool showSlice = true;
+    bool showGrid = true;
+    std::array<float, 3> viewportBackground = {0.268f, 0.268f, 0.268f};
 };
 
 struct GraphSettings
 {
-    PrimitiveSettings primitive;
-    NoiseSettings noise;
-    CrackSettings crack;
     PreviewSettings preview;
     ComputeBackend previewBackend = ComputeBackend::Cpu;
 };
@@ -211,8 +214,11 @@ struct SdfPreviewStats
 
 struct SdfPipeline
 {
+    PrimitiveKind primitiveKind = PrimitiveKind::RockBlob;
     bool useNoise = false;
+    NoiseSettings noise;
     bool useCrack = false;
+    CrackSettings crack;
     bool applyOutputIso = false;
     float outputIsoValue = 0.0f;
 };
@@ -225,6 +231,7 @@ struct EvaluationSummary
     bool finalDirty = true;
     std::string status = "Graph has not been evaluated";
     PreviewStage previewStage = PreviewStage::Output;
+    GraphId previewNodeId = 0;
     ComputeBackend requestedPreviewBackend = ComputeBackend::Cpu;
     ComputeBackend effectivePreviewBackend = ComputeBackend::Cpu;
     bool previewBackendFallback = false;
@@ -250,6 +257,7 @@ public:
 
     const Pin* FindPin(GraphId pinId) const;
     const Node* FindNode(GraphId nodeId) const;
+    Node* FindMutableNode(GraphId nodeId);
     bool IsInputPin(GraphId pinId) const;
     bool IsOutputPin(GraphId pinId) const;
     bool PinHasLink(GraphId pinId) const;
@@ -262,6 +270,7 @@ public:
     void ReplaceNodes(std::vector<Node> nodes);
     void ReplaceLinks(std::vector<Link> links);
     bool SetPreviewStage(PreviewStage stage);
+    bool SetPreviewNode(GraphId nodeId);
     PreviewStage Preview() const;
     SdfPipeline PipelineFor(PreviewStage stage) const;
     SdfPipeline PreviewPipeline() const;
@@ -276,10 +285,10 @@ private:
     GraphId AddPin(GraphId nodeId, PinKind kind, ValueType valueType, std::string label);
     void AddInitialLink(GraphId startPin, GraphId endPin);
     const Node* FindFirstNode(NodeKind kind) const;
-    Node* FindMutableNode(GraphId nodeId);
     const Node* FindNodeByOutputPin(GraphId pinId) const;
     const Node* FindUpstreamNode(const Node& node) const;
     SdfPipeline PipelineTo(NodeKind targetKind) const;
+    SdfPipeline PipelineToNode(const Node& targetNode) const;
 
     std::vector<Node> nodes_;
     std::vector<Link> links_;

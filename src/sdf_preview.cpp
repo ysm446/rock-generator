@@ -164,16 +164,17 @@ float ApplyCracks(float sdf, Vec3 p, const CrackSettings& crack)
 
 float EvaluatePipelineSdf(Vec3 p, const GraphSettings& settings, const SdfPipeline& pipeline)
 {
-    float sdf = PrimitiveSdf(p, settings.primitive.kind);
+    (void)settings;
+    float sdf = PrimitiveSdf(p, pipeline.primitiveKind);
 
     if (pipeline.useNoise)
     {
-        sdf = ApplyNoise(sdf, p, settings.noise);
+        sdf = ApplyNoise(sdf, p, pipeline.noise);
     }
 
     if (pipeline.useCrack)
     {
-        sdf = ApplyCracks(sdf, p, settings.crack);
+        sdf = ApplyCracks(sdf, p, pipeline.crack);
     }
 
     if (pipeline.applyOutputIso)

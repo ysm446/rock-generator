@@ -365,6 +365,10 @@ bool NodeGraph::DeleteNode(GraphId nodeId)
     std::erase_if(nodes_, [nodeId](const Node& candidate) {
         return candidate.id == nodeId;
     });
+    if (evaluation_.previewNodeId == nodeId)
+    {
+        evaluation_.previewNodeId = 0;
+    }
     MarkDirty("Node deleted");
     return true;
 }
@@ -436,6 +440,27 @@ bool NodeGraph::SetPreviewStage(PreviewStage stage)
     return true;
 }
 
+bool NodeGraph::SetPreviewNode(GraphId nodeId)
+{
+    const Node* node = FindNode(nodeId);
+    if (node == nullptr)
+    {
+        return false;
+    }
+
+    const PreviewStage stage = PreviewStageFor(node->kind);
+    if (evaluation_.previewNodeId == nodeId && evaluation_.previewStage == stage)
+    {
+        return false;
+    }
+
+    evaluation_.previewNodeId = nodeId;
+    evaluation_.previewStage = stage;
+    evaluation_.dirty = true;
+    evaluation_.status = std::format("Preview node changed to {}", node->title);
+    return true;
+}
+
 PreviewStage NodeGraph::Preview() const
 {
     return evaluation_.previewStage;
@@ -459,6 +484,10 @@ SdfPipeline NodeGraph::PipelineFor(PreviewStage stage) const
 
 SdfPipeline NodeGraph::PreviewPipeline() const
 {
+    if (const Node* previewNode = FindNode(evaluation_.previewNodeId))
+    {
+        return PipelineToNode(*previewNode);
+    }
     return PipelineFor(evaluation_.previewStage);
 }
 
@@ -523,18 +552,26 @@ const Node* NodeGraph::FindUpstreamNode(const Node& node) const
 
 SdfPipeline NodeGraph::PipelineTo(NodeKind targetKind) const
 {
-    SdfPipeline pipeline;
     const Node* node = FindFirstNode(targetKind);
+    return node != nullptr ? PipelineToNode(*node) : SdfPipeline{};
+}
+
+SdfPipeline NodeGraph::PipelineToNode(const Node& targetNode) const
+{
+    SdfPipeline pipeline;
+    const Node* node = &targetNode;
     int guard = 0;
     while (node != nullptr && guard++ < 16)
     {
         if (node->kind == NodeKind::NoiseWarp)
         {
             pipeline.useNoise = true;
+            pipeline.noise = node->noise;
         }
         else if (node->kind == NodeKind::CrackField)
         {
             pipeline.useCrack = true;
+            pipeline.crack = node->crack;
         }
         else if (node->kind == NodeKind::OutputMesh)
         {
@@ -543,6 +580,7 @@ SdfPipeline NodeGraph::PipelineTo(NodeKind targetKind) const
         }
         else if (node->kind == NodeKind::PrimitiveSdf)
         {
+            pipeline.primitiveKind = node->primitive.kind;
             break;
         }
 
@@ -571,9 +609,9 @@ void NodeGraph::Evaluate(int previewMeshResolution)
         ToString(evaluation_.previewStage),
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
-        ToString(settings_.primitive.kind),
-        finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", settings_.noise.amplitude, settings_.noise.frequency, settings_.noise.octaves) : "",
-        finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", settings_.crack.width, settings_.crack.depth, settings_.crack.roughness) : "",
+        ToString(previewPipeline.primitiveKind),
+        finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", finalPipeline.noise.amplitude, finalPipeline.noise.frequency, finalPipeline.noise.octaves) : "",
+        finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", finalPipeline.crack.width, finalPipeline.crack.depth, finalPipeline.crack.roughness) : "",
         settings_.preview.lod,
         OutputMeshSettingsFor().lod,
         OutputMeshSettingsFor().isoValue,
@@ -586,7 +624,10 @@ void NodeGraph::EvaluateFinal(GraphId outputNodeId)
 {
     const OutputMeshSettings& outputMesh = OutputMeshSettingsFor(outputNodeId);
     const int outputMeshResolution = EffectiveMeshResolution(outputMesh);
-    SdfPipeline finalPipeline = FinalPipeline();
+    const Node* outputNode = FindNode(outputNodeId);
+    SdfPipeline finalPipeline = outputNode != nullptr && outputNode->kind == NodeKind::OutputMesh
+        ? PipelineToNode(*outputNode)
+        : FinalPipeline();
     if (finalPipeline.applyOutputIso)
     {
         finalPipeline.outputIsoValue = outputMesh.isoValue;
@@ -625,9 +666,9 @@ void NodeGraph::EvaluateWithPreview(SdfPreviewStats previewSdf, ComputeBackend r
         ToString(evaluation_.previewStage),
         ToString(evaluation_.effectivePreviewBackend),
         evaluation_.previewBackendFallback ? " fallback" : "",
-        ToString(settings_.primitive.kind),
-        finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", settings_.noise.amplitude, settings_.noise.frequency, settings_.noise.octaves) : "",
-        finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", settings_.crack.width, settings_.crack.depth, settings_.crack.roughness) : "",
+        ToString(previewPipeline.primitiveKind),
+        finalPipeline.useNoise ? std::format(" -> noise {:.2f}/{:.2f}/{}", finalPipeline.noise.amplitude, finalPipeline.noise.frequency, finalPipeline.noise.octaves) : "",
+        finalPipeline.useCrack ? std::format(" -> crack {:.3f}/{:.2f}/{:.2f}", finalPipeline.crack.width, finalPipeline.crack.depth, finalPipeline.crack.roughness) : "",
         settings_.preview.lod,
         OutputMeshSettingsFor().lod,
         OutputMeshSettingsFor().isoValue,

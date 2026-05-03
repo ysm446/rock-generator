@@ -289,7 +289,9 @@ UiTheme UiThemeManager::MakeBuiltInLithicDark()
         {"surfaceWire", ImVec4(0.34f, 0.34f, 0.34f, 0.70f)},
         {"surfacePoint", ImVec4(0.78f, 0.84f, 0.72f, 0.82f)},
         {"accentText", ImVec4(0.82f, 0.87f, 0.80f, 1.0f)},
-        {"mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)}
+        {"mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)},
+        {"nodeEditorBg", ImVec4(0.115f, 0.115f, 0.115f, 1.0f)},
+        {"nodeGridDot", ImVec4(0.255f, 0.255f, 0.255f, 0.46f)}
     };
     return theme;
 }
