@@ -1,0 +1,388 @@
+SDF岩生成ツール 開発計画書
+1. 目的
+
+Windows向けのスタンドアロン岩生成ツールを作る。
+ZBrushのような破壊的スカルプトではなく、Houdini風の非破壊ノードベースで、SDF/VDBを中心に岩の形状・節理・亀裂・欠けを生成し、最終的にゲーム用メッシュとテクスチャを出力する。
+
+2. 基本方針
+
+制作中の内部表現は SDF / Volume。
+最終出力は ゲームエンジン向けメッシュ + ベイク済みテクスチャ。
+
+SDF生成
+  ↓
+亀裂・節理・破断
+  ↓
+SDFプレビュー / メッシュプレビュー
+  ↓
+高密度メッシュ生成
+  ↓
+LOD・UV・ベイク
+  ↓
+glTF / FBX / OBJ 出力
+3. 推奨API構成
+コア
+Language: C++20
+Build: CMake + vcpkg
+Platform: Windows
+UI / ノード
+Dear ImGui
+imgui-node-editor
+
+Dear ImGuiはMITライセンスで、軽量なC++ GUIとして使いやすいです。
+imgui-node-editor はDear ImGuiベースのノードエディタで、Blueprint系の複雑なノードUIの土台として使う目的のライブラリです。
+
+描画 / GPU
+DirectX 12
+HLSL
+
+Windows限定・ゲームデータ寄りならDirectX 12で良いです。Microsoftの説明でもDirect3D 12はDirectXの中核となる3D APIで、現代GPUを効率的に使うためのAPIとして位置づけられています。
+
+Volume / SDF
+OpenVDB
+NanoVDB later
+
+最初はCPU側でOpenVDB。
+後でGPUプレビュー・高速サンプリング用にNanoVDB。
+
+Mesh / Game Asset
+meshoptimizer
+xatlas
+MikkTSpace
+Assimp or tinygltf
+OpenEXR / stb_image
+4. MVP目標
+
+最初のMVPでは、リアルな岩生成の全機能は狙わない。
+「ノードでSDF岩を作り、亀裂を入れ、メッシュとして出力できる」ことを目標にする。
+
+MVP機能
+1. Dear ImGuiウィンドウ
+2. DirectXビューポート
+3. imgui-node-editorによる簡単なノード接続
+4. Primitive SDF Node
+5. Noise Warp Node
+6. Crack Field Node
+7. Volume To Mesh Node
+8. OBJまたはglTF出力
+5. 初期ノード設計
+5.1 Primitive SDF Node
+
+基本形状を作る。
+
+Sphere
+Box
+Capsule
+Ellipsoid
+Rock Blob
+
+出力：
+
+SDFGrid
+5.2 Noise Warp Node
+
+岩らしい不規則形状を作る。
+
+パラメータ：
+
+amplitude
+frequency
+octaves
+seed
+direction_bias
+5.3 Rock Material Node
+
+岩の性質を設定する。
+
+rock_type
+hardness
+brittleness
+toughness
+layer_strength
+weathering
+
+最初は物理値ではなく、生成パラメータとして扱う。
+
+5.4 Joint Field Node
+
+節理の方向性を作る。
+
+joint_sets
+direction
+spacing
+jitter
+roughness
+continuity
+
+出力：
+
+JointField
+5.5 Crack Field Node
+
+亀裂を生成する。
+
+primary_crack_count
+secondary_crack_count
+crack_width
+crack_depth
+crack_roughness
+branching
+seed
+
+重要なのは、亀裂をスケール別に分けること。
+
+Primary Crack
+Secondary Crack
+Micro Crack
+5.6 Fracture / Edge Damage Node
+
+破断面・欠けを作る。
+
+chip_amount
+edge_damage
+fracture_noise
+sharpness
+5.7 Volume To Mesh Node
+
+SDFをメッシュ化する。
+
+voxel_size
+adaptivity
+smoothing
+normal_mode
+5.8 Export Node
+OBJ
+glTF
+FBX later
+6. ビューポート設計
+
+ビューポートは2モード持つ。
+
+6.1 Mesh Preview
+
+最初に実装する。
+SDFをメッシュ化し、DirectXで普通にポリゴン描画する。
+
+用途：
+
+形状確認
+最終出力確認
+マテリアル確認
+LOD確認
+6.2 SDF Raymarch Preview
+
+後から実装する。
+3D TextureまたはNanoVDBをGPUに送り、HLSLでレイマーチする。
+
+用途：
+
+メッシュ化前のSDF確認
+亀裂の確認
+ボリュームのデバッグ
+高速な編集プレビュー
+
+最初は3D Textureで十分。
+
+7. データ構造案
+struct RockAsset {
+    NodeGraph graph;
+    VolumeData sdf;
+    MeshData highMesh;
+    MeshData lodMeshes[4];
+    TextureSet bakedTextures;
+};
+
+struct VolumeData {
+    OpenVDBGridPtr sdfGrid;
+    float voxelSize;
+    BoundingBox bounds;
+};
+
+struct CrackSettings {
+    int primaryCount;
+    int secondaryCount;
+    float width;
+    float depth;
+    float roughness;
+    float branching;
+    uint32_t seed;
+};
+
+struct RockMaterialSettings {
+    float hardness;
+    float brittleness;
+    float toughness;
+    float layerStrength;
+    float weathering;
+};
+8. 開発フェーズ
+Phase 0: 技術検証
+
+目的：
+
+Dear ImGui + DirectX表示
+OpenVDBでSDF作成
+SDFをメッシュ化
+画面に表示
+
+完了条件：
+
+球SDFを作る
+ノイズで歪ませる
+メッシュ化する
+DirectXで表示する
+Phase 1: ノードエディタ
+
+目的：
+
+ノードを追加
+ノードを接続
+パラメータ変更で再計算
+
+最初のノード：
+
+Primitive SDF
+Noise Warp
+Volume To Mesh
+Output
+Phase 2: 亀裂生成
+
+目的：
+
+岩らしさの中心である亀裂を実装
+
+実装：
+
+Crack Field
+Joint Field
+Fracture Plane
+Edge Damage
+
+完了条件：
+
+節理方向に沿った亀裂が入る
+亀裂幅・深さ・荒さを調整できる
+Phase 3: ゲームアセット化
+
+目的：
+
+ゲーム用データとして使える形にする
+
+実装：
+
+LOD生成
+UV展開
+normal / AO / curvature / cavity bake
+glTF出力
+Phase 4: SDF Raymarch Preview
+
+目的：
+
+メッシュ化前の状態を高速確認
+
+実装：
+
+OpenVDB → 3D Texture
+HLSL Raymarch
+簡易ライティング
+SDF normal
+AO風表現
+Phase 5: GPU最適化
+
+目的：
+
+重い処理をGPUへ移す
+
+候補：
+
+Noise Warp
+Crack Field sampling
+Raymarch preview
+Curvature / AO bake
+
+NanoVDBはこの段階で検討。
+
+9. Codexへの最初の依頼例
+
+最初はこれくらい小さく切るのが良いです。
+
+C++20 / CMake / Windows projectを作成してください。
+Dear ImGui + DirectX 12 の基本ウィンドウを作り、
+中央に3Dビューポート、左にノードエディタ領域、右にプロパティパネルを配置してください。
+まだOpenVDBは使わず、ビューポートには回転するキューブを表示してください。
+
+次：
+
+OpenVDBを依存関係に追加し、
+Sphere SDFを作成してメッシュ化し、
+DirectX 12ビューポートに表示してください。
+
+次：
+
+imgui-node-editorを追加し、
+Primitive SDF Node → Noise Warp Node → Volume To Mesh Node → Output Node
+という固定グラフを作り、各ノードのパラメータをImGuiで編集できるようにしてください。
+10. 最初に作るべき画面
++--------------------------------------------------+
+| Menu: File Edit View Build Export                |
++------------------+-------------------------------+
+| Node Graph       | Viewport                      |
+|                  |                               |
+| [Primitive SDF]--|  Rock Preview                 |
+|       |          |                               |
+| [Noise Warp]-----|                               |
+|       |          |                               |
+| [Crack Field]----|                               |
+|       |          |                               |
+| [Output Mesh]----|                               |
++------------------+-------------------------------+
+| Properties       | Asset / Bake / Export          |
++------------------+-------------------------------+
+11. 優先順位
+
+最重要：
+
+1. SDFから岩らしい形が作れる
+2. 亀裂が制御できる
+3. メッシュとして出力できる
+
+後回し：
+
+高度な侵食
+完全GPU化
+FBX対応
+高度なマテリアル
+物理破断シミュレーション
+12. リスク
+OpenVDB導入が重い
+
+対策：
+
+最初はOpenVDBなしでUI/Viewportを作る
+次にOpenVDBを追加
+DX12が重い
+
+対策：
+
+DX11で開始してもよい
+ただし最終的にはDX12へ移行
+亀裂が人工的になる
+
+対策：
+
+節理方向
+複数スケール
+岩種プリセット
+ランダムではなくField制御
+13. 最終的な理想像
+RockForge / StoneGraph / Lithic
+
+のような、岩専用ノードベース生成ツール。
+
+中心コンセプト：
+
+岩をスカルプトするのではなく、
+節理・硬さ・亀裂・破断を積み重ねて生成する
+
+最初の一歩は、DX12 + Dear ImGui + imgui-node-editorで空のアプリを作るところで十分です。
+そこからOpenVDBを足すのが一番安全です。

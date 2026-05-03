@@ -1,0 +1,14 @@
+{
+  "name": "rock-generator",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "imgui-node-editor",
+    {
+      "name": "imgui",
+      "features": [
+        "dx12-binding",
+        "win32-binding"
+      ]
+    }
+  ]
+}
