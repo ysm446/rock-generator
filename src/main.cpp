@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -83,6 +84,7 @@ std::string g_projectStatus = "No project file";
 std::filesystem::path g_projectPath;
 std::vector<std::filesystem::path> g_recentProjectPaths;
 std::vector<std::pair<rock::GraphId, ImVec2>> g_pendingNodePositions;
+std::vector<std::pair<rock::GraphId, ImVec2>> g_nodePositionCache;
 std::vector<rock::GraphId> g_pendingSelectedNodeIds;
 rock::UiThemeManager g_themeManager;
 rock::GraphId g_selectedNodeId = 0;
@@ -225,14 +227,30 @@ struct RaymarchComputeConstants
     float padding[2]{};
 };
 
+std::string MakeWindowTitleText()
+{
+    std::string title = "Rock Generator v" + std::string(ROCK_GENERATOR_VERSION_STRING) + " ";
+    title += g_projectPath.empty() ? "Untitled" : g_projectPath.filename().string();
+    return title;
+}
+
 std::wstring MakeWindowTitle()
 {
-    std::wstring title = L"Mesh Generator ";
-    for (const char c : std::string(ROCK_GENERATOR_VERSION_STRING))
-    {
-        title.push_back(static_cast<wchar_t>(c));
-    }
+    std::wstring title = L"Rock Generator v" +
+        std::to_wstring(ROCK_GENERATOR_VERSION_MAJOR) + L"." +
+        std::to_wstring(ROCK_GENERATOR_VERSION_MINOR) + L"." +
+        std::to_wstring(ROCK_GENERATOR_VERSION_PATCH) + L" ";
+    title += g_projectPath.empty() ? L"Untitled" : g_projectPath.filename().wstring();
     return title;
+}
+
+void UpdateWindowTitle()
+{
+    if (g_hwnd != nullptr)
+    {
+        const std::string title = MakeWindowTitleText();
+        SetWindowTextA(g_hwnd, title.c_str());
+    }
 }
 
 void ThrowIfFailed(HRESULT hr, const char* message)
@@ -781,6 +799,7 @@ void ResetNodeEditorViewToDefault()
     g_nodePositionsInitialized = false;
     g_nodeGraphNavigatedToContent = false;
     g_pendingNodePositions.clear();
+    g_nodePositionCache.clear();
     g_pendingSelectedNodeIds.clear();
     if (g_nodeEditor != nullptr)
     {
@@ -788,7 +807,9 @@ void ResetNodeEditorViewToDefault()
         ed::ClearSelection();
         for (const rock::Node& node : g_graph.Nodes())
         {
-            ed::SetNodePosition(ed::NodeId(node.id), InitialNodePosition(node.kind));
+            const ImVec2 position = InitialNodePosition(node.kind);
+            ed::SetNodePosition(ed::NodeId(node.id), position);
+            g_nodePositionCache.push_back({node.id, position});
         }
         ed::NavigateToContent(0.0f);
         ed::SetCurrentEditor(nullptr);
@@ -801,6 +822,7 @@ void NewProject()
 {
     g_graph = rock::NodeGraph::CreateDefaultRockGraph();
     g_projectPath.clear();
+    UpdateWindowTitle();
     g_projectStatus = "New project";
     g_exportStatus = "No export yet";
     ResetViewport();
@@ -878,12 +900,25 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
             {
                 root["selectedNodeIds"].push_back(static_cast<rock::GraphId>(selectedNodes[static_cast<size_t>(i)].Get()));
             }
-            for (const rock::Node& node : g_graph.Nodes())
-            {
-                const ImVec2 position = ed::GetNodePosition(ed::NodeId(node.id));
-                root["nodePositions"][std::to_string(node.id)] = {position.x, position.y};
-            }
             ed::SetCurrentEditor(nullptr);
+        }
+        for (const rock::Node& node : g_graph.Nodes())
+        {
+            ImVec2 position = InitialNodePosition(node.kind);
+            const auto cached = std::ranges::find_if(g_nodePositionCache, [&](const auto& entry) {
+                return entry.first == node.id;
+            });
+            if (cached != g_nodePositionCache.end())
+            {
+                position = cached->second;
+            }
+            else if (g_nodeEditor != nullptr)
+            {
+                ed::SetCurrentEditor(g_nodeEditor);
+                position = ed::GetNodePosition(ed::NodeId(node.id));
+                ed::SetCurrentEditor(nullptr);
+            }
+            root["nodePositions"][std::to_string(node.id)] = {position.x, position.y};
         }
 
         if (path.has_parent_path())
@@ -898,6 +933,7 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
         }
         stream << root.dump(2);
         g_projectPath = path;
+        UpdateWindowTitle();
         AddRecentProjectPath(path);
         SaveAppSettingsSilently();
         g_projectStatus = "Saved " + PathToUtf8(path);
@@ -907,6 +943,22 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
     {
         if (error) *error = ex.what();
         return false;
+    }
+}
+
+void SaveCurrentProject()
+{
+    const std::optional<std::filesystem::path> path =
+        g_projectPath.empty() ? ShowProjectFileDialog(true) : std::optional<std::filesystem::path>(g_projectPath);
+    if (!path)
+    {
+        return;
+    }
+
+    std::string error;
+    if (!SaveProjectToFile(*path, &error))
+    {
+        g_projectStatus = "Save failed: " + error;
     }
 }
 
@@ -1003,6 +1055,7 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         g_graph.SetPreviewStage(static_cast<rock::PreviewStage>(std::clamp(root.value("previewStage", static_cast<int>(g_graph.Preview())), 0, 3)));
 
         g_pendingNodePositions.clear();
+        g_nodePositionCache.clear();
         if (root.contains("nodePositions") && root["nodePositions"].is_object())
         {
             for (const rock::Node& node : g_graph.Nodes())
@@ -1016,7 +1069,9 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
                 const nlohmann::json& positionJson = root["nodePositions"][key];
                 if (positionJson.is_array() && positionJson.size() == 2)
                 {
-                    g_pendingNodePositions.push_back({node.id, ImVec2(positionJson[0].get<float>(), positionJson[1].get<float>())});
+                    const ImVec2 position(positionJson[0].get<float>(), positionJson[1].get<float>());
+                    g_pendingNodePositions.push_back({node.id, position});
+                    g_nodePositionCache.push_back({node.id, position});
                 }
             }
         }
@@ -1030,6 +1085,7 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         }
 
         g_projectPath = path;
+        UpdateWindowTitle();
         AddRecentProjectPath(path);
         SaveAppSettingsSilently();
         g_projectStatus = "Loaded " + PathToUtf8(path);
@@ -2140,6 +2196,15 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     const std::string title = "SDF Preview: " + std::string(rock::ToString(g_graph.Preview()));
     drawList->AddText(ImVec2(min.x + 16.0f, min.y + 14.0f), ThemeColor("accentText", ImVec4(0.86f, 0.88f, 0.85f, 1.0f)), title.c_str());
     drawList->AddText(ImVec2(min.x + 16.0f, min.y + 36.0f), ThemeColor("mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)), "Right-handed, Y-up, 10 x 10 m grid");
+    char fpsText[32]{};
+    std::snprintf(fpsText, sizeof(fpsText), "FPS %.1f", ImGui::GetIO().Framerate);
+    const ImVec2 fpsSize = ImGui::CalcTextSize(fpsText);
+    const ImVec2 fpsPadding(9.0f, 5.0f);
+    const ImVec2 fpsMax(max.x - 14.0f, min.y + 14.0f + fpsSize.y + fpsPadding.y * 2.0f);
+    const ImVec2 fpsMin(fpsMax.x - fpsSize.x - fpsPadding.x * 2.0f, min.y + 14.0f);
+    drawList->AddRectFilled(fpsMin, fpsMax, IM_COL32(8, 10, 10, 168), 4.0f);
+    drawList->AddRect(fpsMin, fpsMax, ThemeColor("border", ImVec4(0.20f, 0.23f, 0.22f, 0.70f)), 4.0f);
+    drawList->AddText(ImVec2(fpsMin.x + fpsPadding.x, fpsMin.y + fpsPadding.y), ThemeColor("accentText", ImVec4(0.86f, 0.88f, 0.85f, 1.0f)), fpsText);
     DrawViewportAxisGizmo(drawList, min, max);
     if (g_graph.Settings().outputMesh.showSlice)
     {
@@ -2229,59 +2294,148 @@ ImU32 ThemeColor(const std::string& name, const ImVec4& fallback)
     return ColorToU32(g_themeManager.AppColor(name, fallback));
 }
 
-void DrawPinLabel(const rock::Pin& pin)
+ImVec4 PinColor(const rock::Pin& pin)
 {
     const bool connected = g_graph.PinHasLink(pin.id);
-    const ImVec4 color = connected ? ImVec4(0.80f, 0.88f, 0.82f, 1.0f) : ImVec4(0.54f, 0.59f, 0.57f, 1.0f);
-    ImGui::TextColored(color, "%s", pin.label.c_str());
+    return connected ? ImVec4(0.70f, 0.93f, 0.78f, 1.0f) : ImVec4(0.52f, 0.58f, 0.56f, 1.0f);
 }
 
-void DrawNodeDivider(float width)
+void DrawNodeIcon(const ImVec2& origin, const ImVec4& color)
 {
-    const ImVec2 cursor = ImGui::GetCursorScreenPos();
-    const float y = cursor.y + 3.0f;
-    ImGui::GetWindowDrawList()->AddLine(
-        ImVec2(cursor.x, y),
-        ImVec2(cursor.x + width, y),
-        ThemeColor("border", ImVec4(0.28f, 0.31f, 0.30f, 1.0f)),
-        1.0f);
-    ImGui::Dummy(ImVec2(width, 8.0f));
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImU32 iconColor = ColorToU32(color);
+    drawList->AddTriangleFilled(
+        ImVec2(origin.x + 2.0f, origin.y + 17.0f),
+        ImVec2(origin.x + 7.0f, origin.y + 4.0f),
+        ImVec2(origin.x + 11.0f, origin.y + 17.0f),
+        iconColor);
+    drawList->AddRectFilled(ImVec2(origin.x + 9.0f, origin.y + 9.0f), ImVec2(origin.x + 15.0f, origin.y + 18.0f), iconColor, 2.0f);
+    drawList->AddTriangleFilled(
+        ImVec2(origin.x + 14.0f, origin.y + 18.0f),
+        ImVec2(origin.x + 20.0f, origin.y + 7.0f),
+        ImVec2(origin.x + 24.0f, origin.y + 18.0f),
+        iconColor);
+}
+
+void DrawRoundPin(const rock::Pin& pin)
+{
+    const ImVec2 size(14.0f, 20.0f);
+    ImGui::Dummy(size);
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    const ImVec2 center((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
+    const ImVec4 color = PinColor(pin);
+    ImGui::GetWindowDrawList()->AddCircle(center, 4.3f, ColorToU32(color), 16, 1.6f);
 }
 
 void DrawRockNode(const rock::Node& node)
 {
+    constexpr float nodeWidth = 250.0f;
+    const ImVec4 accent = NodeAccentColor(node.kind);
+    ed::PushStyleVar(ed::StyleVar_NodePadding, ImVec4(12.0f, 10.0f, 12.0f, 10.0f));
+    ed::PushStyleVar(ed::StyleVar_NodeRounding, 8.0f);
+    ed::PushStyleVar(ed::StyleVar_NodeBorderWidth, 1.0f);
+    ed::PushStyleVar(ed::StyleVar_SelectedNodeBorderWidth, 1.8f);
+    ed::PushStyleColor(ed::StyleColor_NodeBg, ImVec4(0.080f, 0.080f, 0.080f, 0.98f));
+    ed::PushStyleColor(ed::StyleColor_NodeBorder, ImVec4(0.22f, 0.22f, 0.22f, 1.0f));
+    ed::PushStyleColor(ed::StyleColor_SelNodeBorder, accent);
+
     ed::BeginNode(ed::NodeId(node.id));
-    ImGui::PushStyleColor(ImGuiCol_Text, NodeAccentColor(node.kind));
+
+    const ImVec2 headerCursor = ImGui::GetCursorScreenPos();
+    DrawNodeIcon(headerCursor, accent);
+    ImGui::Dummy(ImVec2(28.0f, 20.0f));
+    ImGui::SameLine();
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.88f, 0.88f, 1.0f));
     ImGui::TextUnformatted(node.title.c_str());
     ImGui::PopStyleColor();
-    DrawNodeDivider(150.0f);
+
+    ImGui::Dummy(ImVec2(nodeWidth, 8.0f));
+    const float rowStartX = ImGui::GetCursorPosX();
+    const float rowY = ImGui::GetCursorPosY();
 
     if (!node.inputs.empty())
     {
+        ImGui::SetCursorPos(ImVec2(rowStartX, rowY));
         ed::BeginPin(ed::PinId(node.inputs.front().id), ed::PinKind::Input);
-        DrawPinLabel(node.inputs.front());
+        ed::PinPivotAlignment(ImVec2(0.0f, 0.5f));
+        ed::PinPivotSize(ImVec2(12.0f, 12.0f));
+        DrawRoundPin(node.inputs.front());
         ed::EndPin();
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(rowY + 2.0f);
+        ImGui::TextColored(PinColor(node.inputs.front()), "%s", node.inputs.front().label.c_str());
     }
     else
     {
-        ImGui::Dummy(ImVec2(62.0f, ImGui::GetTextLineHeight()));
+        ImGui::SetCursorPos(ImVec2(rowStartX, rowY));
+        ImGui::Dummy(ImVec2(14.0f, 20.0f));
     }
 
     if (!node.outputs.empty())
     {
-        ImGui::SameLine(104.0f);
+        const rock::Pin& output = node.outputs.front();
+        const float labelWidth = ImGui::CalcTextSize(output.label.c_str()).x;
+        ImGui::SetCursorPos(ImVec2(rowStartX + nodeWidth - labelWidth - 22.0f, rowY + 2.0f));
+        ImGui::TextColored(PinColor(output), "%s", output.label.c_str());
+        ImGui::SameLine();
+        ImGui::SetCursorPosY(rowY);
         ed::BeginPin(ed::PinId(node.outputs.front().id), ed::PinKind::Output);
-        DrawPinLabel(node.outputs.front());
+        ed::PinPivotAlignment(ImVec2(1.0f, 0.5f));
+        ed::PinPivotSize(ImVec2(12.0f, 12.0f));
+        DrawRoundPin(output);
         ed::EndPin();
     }
+    ImGui::Dummy(ImVec2(nodeWidth, 4.0f));
 
     ed::EndNode();
+    ed::PopStyleColor(3);
+    ed::PopStyleVar(4);
+}
+
+void DrawNodeGraphDots(const ImVec2& screenMin, const ImVec2& screenMax)
+{
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 canvasMin = ed::ScreenToCanvas(screenMin);
+    const ImVec2 canvasMax = ed::ScreenToCanvas(screenMax);
+    constexpr float spacing = 24.0f;
+
+    const float startX = std::floor(std::min(canvasMin.x, canvasMax.x) / spacing) * spacing;
+    const float endX = std::ceil(std::max(canvasMin.x, canvasMax.x) / spacing) * spacing;
+    const float startY = std::floor(std::min(canvasMin.y, canvasMax.y) / spacing) * spacing;
+    const float endY = std::ceil(std::max(canvasMin.y, canvasMax.y) / spacing) * spacing;
+    const ImU32 backgroundColor = ThemeColor("nodeEditorBg", ImVec4(0.082f, 0.082f, 0.082f, 1.0f));
+    const ImU32 dotColor = ThemeColor("nodeGridDot", ImVec4(0.205f, 0.205f, 0.205f, 0.50f));
+
+    ed::Suspend();
+    drawList->PushClipRect(screenMin, screenMax, true);
+    drawList->AddRectFilled(screenMin, screenMax, backgroundColor);
+    for (float y = startY; y <= endY; y += spacing)
+    {
+        for (float x = startX; x <= endX; x += spacing)
+        {
+            const ImVec2 screen = ed::CanvasToScreen(ImVec2(x, y));
+            if (screen.x < screenMin.x || screen.x > screenMax.x || screen.y < screenMin.y || screen.y > screenMax.y)
+            {
+                continue;
+            }
+            drawList->AddCircleFilled(screen, 1.15f, dotColor, 8);
+        }
+    }
+    drawList->PopClipRect();
+    ed::Resume();
 }
 
 void DrawNodeGraph()
 {
     ed::SetCurrentEditor(g_nodeEditor);
+    const ImVec2 canvasMin = ImGui::GetCursorScreenPos();
+    const ImVec2 canvasMax(canvasMin.x + ImGui::GetContentRegionAvail().x, canvasMin.y + ImGui::GetContentRegionAvail().y);
+    ed::PushStyleColor(ed::StyleColor_Bg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ed::PushStyleColor(ed::StyleColor_Grid, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
     ed::Begin("Rock Node Graph", ImGui::GetContentRegionAvail());
+    DrawNodeGraphDots(canvasMin, canvasMax);
 
     const bool hasPendingNodePositions = !g_pendingNodePositions.empty();
     for (const rock::Node& node : g_graph.Nodes())
@@ -2407,6 +2561,13 @@ void DrawNodeGraph()
     }
 
     ed::End();
+    g_nodePositionCache.clear();
+    for (const rock::Node& node : g_graph.Nodes())
+    {
+        const ImVec2 position = ed::GetNodePosition(ed::NodeId(node.id));
+        g_nodePositionCache.push_back({node.id, position});
+    }
+    ed::PopStyleColor(2);
     ed::SetCurrentEditor(nullptr);
 }
 
@@ -2819,6 +2980,17 @@ void DrawAssetExportPanel()
     ImGui::Columns(1);
 }
 
+void BeginInspectorTabContent()
+{
+    ImGui::Spacing();
+    ImGui::Indent(10.0f);
+}
+
+void EndInspectorTabContent()
+{
+    ImGui::Unindent(10.0f);
+}
+
 bool DrawVerticalSplitter(const char* id, float* leftWidth, float totalWidth, float minLeftWidth, float minRightWidth, float height)
 {
     constexpr float splitterWidth = 7.0f;
@@ -2926,6 +3098,12 @@ void DrawUi()
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
     ImGui::Begin("Rock Generator Shell", nullptr, shellFlags);
 
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.KeyCtrl && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_S, false))
+    {
+        SaveCurrentProject();
+    }
+
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 8.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 5.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 6.0f));
@@ -2951,15 +3129,7 @@ void DrawUi()
             }
             if (ImGui::MenuItem("保存", "Ctrl+S"))
             {
-                std::optional<std::filesystem::path> path = g_projectPath.empty() ? ShowProjectFileDialog(true) : std::optional<std::filesystem::path>(g_projectPath);
-                if (path)
-                {
-                    std::string error;
-                    if (!SaveProjectToFile(*path, &error))
-                    {
-                        g_projectStatus = "Save failed: " + error;
-                    }
-                }
+                SaveCurrentProject();
             }
             if (ImGui::MenuItem("名前を付けて保存"))
             {
@@ -3175,13 +3345,16 @@ void DrawUi()
     g_ui.nodePaneHeight = std::clamp(g_ui.nodePaneHeight, 160.0f, std::max(160.0f, rightColumnHeight - 160.0f - inspectorSplitterHeight));
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.0f, 8.0f));
     ImGui::BeginChild("Node Network", ImVec2(0.0f, g_ui.nodePaneHeight), false, fixedPaneFlags);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
+    ImGui::Dummy(ImVec2(0.0f, 3.0f));
     ImGui::TextUnformatted("ノードネットワーク");
     ImGui::Separator();
     DrawNodeGraph();
     ImGui::PopStyleVar();
     ImGui::EndChild();
+    ImGui::PopStyleVar();
 
     if (DrawHorizontalSplitter("InspectorLayoutSplitter", &g_ui.nodePaneHeight, rightColumnHeight, 160.0f, 160.0f))
     {
@@ -3194,27 +3367,37 @@ void DrawUi()
     {
         if (ImGui::BeginTabItem("プロパティ"))
         {
+            BeginInspectorTabContent();
             DrawPropertiesPanel();
+            EndInspectorTabContent();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("統計"))
         {
+            BeginInspectorTabContent();
             DrawStatsPanel();
+            EndInspectorTabContent();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("カメラ"))
         {
+            BeginInspectorTabContent();
             DrawCameraPanel();
+            EndInspectorTabContent();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("計算"))
         {
+            BeginInspectorTabContent();
             DrawComputePanel();
+            EndInspectorTabContent();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("エクスポート"))
         {
+            BeginInspectorTabContent();
             DrawAssetExportPanel();
+            EndInspectorTabContent();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -3324,12 +3507,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 
         RECT rect{0, 0, static_cast<LONG>(g_width), static_cast<LONG>(g_height)};
         AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-        const std::wstring windowTitle = MakeWindowTitle();
+        const std::wstring windowTitle = L"Rock Generator";
         g_hwnd = CreateWindowW(wc.lpszClassName, windowTitle.c_str(), WS_OVERLAPPEDWINDOW, 100, 100, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, wc.hInstance, nullptr);
         if (!g_hwnd)
         {
             throw std::runtime_error("CreateWindow failed");
         }
+        UpdateWindowTitle();
 
         InitD3D(g_hwnd);
 
