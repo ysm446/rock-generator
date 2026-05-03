@@ -10,7 +10,8 @@ cbuffer Settings : register(b0)
     float crackWidth;
     float crackDepth;
     float crackRoughness;
-    float2 preCameraPadding;
+    float isoValue;
+    float preCameraPadding;
     float4 cameraPosition;
     float4 cameraRight;
     float4 cameraUp;
@@ -125,6 +126,8 @@ float evaluate_sdf(float3 p)
         sdf = apply_noise(sdf, p);
     if (previewStage >= 2)
         sdf = apply_cracks(sdf, p);
+    if (previewStage >= 3)
+        sdf -= isoValue;
     return sdf;
 }
 

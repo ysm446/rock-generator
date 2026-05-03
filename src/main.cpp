@@ -183,7 +183,7 @@ struct SdfComputeConstants
     float crackWidth = 0.0f;
     float crackDepth = 0.0f;
     float crackRoughness = 0.0f;
-    float padding0 = 0.0f;
+    float isoValue = 0.0f;
     float padding1 = 0.0f;
     float padding2 = 0.0f;
 };
@@ -200,7 +200,8 @@ struct RaymarchComputeConstants
     float crackWidth = 0.0f;
     float crackDepth = 0.0f;
     float crackRoughness = 0.0f;
-    float preCameraPadding[2]{};
+    float isoValue = 0.0f;
+    float preCameraPadding = 0.0f;
     float cameraPosition[4]{};
     float cameraRight[4]{};
     float cameraUp[4]{};
@@ -215,7 +216,7 @@ struct RaymarchComputeConstants
 
 std::wstring MakeWindowTitle()
 {
-    std::wstring title = L"Rock Generator ";
+    std::wstring title = L"Mesh Generator ";
     for (const char c : std::string(ROCK_GENERATOR_VERSION_STRING))
     {
         title.push_back(static_cast<wchar_t>(c));
@@ -774,6 +775,16 @@ bool SaveProjectToFile(const std::filesystem::path& path, std::string* error)
                 {"depth", settings.crack.depth},
                 {"roughness", settings.crack.roughness},
             }},
+            {"outputMesh", {
+                {"resolution", settings.outputMesh.resolution},
+                {"lod", settings.outputMesh.lod},
+                {"isoValue", settings.outputMesh.isoValue},
+                {"displayMode", static_cast<int>(settings.outputMesh.displayMode)},
+                {"showSurface", settings.outputMesh.showSurface},
+                {"showWireframe", settings.outputMesh.showWireframe},
+                {"showPoints", settings.outputMesh.showPoints},
+                {"showSlice", settings.outputMesh.showSlice},
+            }},
             {"previewBackend", static_cast<int>(settings.previewBackend)},
         };
 
@@ -856,6 +867,7 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         const nlohmann::json primitiveJson = settingsJson.value("primitive", nlohmann::json::object());
         const nlohmann::json noiseJson = settingsJson.value("noise", nlohmann::json::object());
         const nlohmann::json crackJson = settingsJson.value("crack", nlohmann::json::object());
+        const nlohmann::json outputMeshJson = settingsJson.value("outputMesh", nlohmann::json::object());
         settings.primitive.kind = static_cast<rock::PrimitiveKind>(std::clamp(primitiveJson.value("kind", static_cast<int>(settings.primitive.kind)), 0, 4));
         settings.noise.amplitude = noiseJson.value("amplitude", settings.noise.amplitude);
         settings.noise.frequency = noiseJson.value("frequency", settings.noise.frequency);
@@ -863,6 +875,14 @@ bool LoadProjectFromFile(const std::filesystem::path& path, std::string* error)
         settings.crack.width = crackJson.value("width", settings.crack.width);
         settings.crack.depth = crackJson.value("depth", settings.crack.depth);
         settings.crack.roughness = crackJson.value("roughness", settings.crack.roughness);
+        settings.outputMesh.resolution = std::clamp(outputMeshJson.value("resolution", settings.outputMesh.resolution), 16, 96);
+        settings.outputMesh.lod = std::clamp(outputMeshJson.value("lod", settings.outputMesh.lod), 0, 4);
+        settings.outputMesh.isoValue = std::clamp(outputMeshJson.value("isoValue", settings.outputMesh.isoValue), -0.2f, 0.2f);
+        settings.outputMesh.displayMode = static_cast<rock::MeshDisplayMode>(std::clamp(outputMeshJson.value("displayMode", static_cast<int>(settings.outputMesh.displayMode)), 0, 1));
+        settings.outputMesh.showSurface = outputMeshJson.value("showSurface", settings.outputMesh.showSurface);
+        settings.outputMesh.showWireframe = outputMeshJson.value("showWireframe", settings.outputMesh.showWireframe);
+        settings.outputMesh.showPoints = outputMeshJson.value("showPoints", settings.outputMesh.showPoints);
+        settings.outputMesh.showSlice = outputMeshJson.value("showSlice", settings.outputMesh.showSlice);
         settings.previewBackend = static_cast<rock::ComputeBackend>(std::clamp(settingsJson.value("previewBackend", static_cast<int>(settings.previewBackend)), 0, 2));
 
         const nlohmann::json viewportJson = root.value("viewport", nlohmann::json::object());
@@ -1138,6 +1158,7 @@ bool TryBuildGpuPreviewSdf(const rock::GraphSettings& settings, rock::PreviewSta
         constants.crackWidth = settings.crack.width;
         constants.crackDepth = settings.crack.depth;
         constants.crackRoughness = settings.crack.roughness;
+        constants.isoValue = settings.outputMesh.isoValue;
 
         commandList->SetComputeRootSignature(g_sdfComputeRootSignature.Get());
         commandList->SetPipelineState(g_sdfComputePipelineState.Get());
@@ -1191,7 +1212,8 @@ void EvaluateGraph()
 
     rock::SdfPreviewStats gpuPreview;
     std::string error;
-    if (TryBuildGpuPreviewSdf(settings, g_graph.Preview(), 48, gpuPreview, &error))
+    const int meshResolution = std::clamp(settings.outputMesh.resolution / (1 << std::clamp(settings.outputMesh.lod, 0, 4)), 16, 96);
+    if (TryBuildGpuPreviewSdf(settings, g_graph.Preview(), meshResolution, gpuPreview, &error))
     {
         g_graph.EvaluateWithPreview(std::move(gpuPreview), settings.previewBackend, rock::ComputeBackend::GpuPreview, false);
         return;
@@ -1627,6 +1649,7 @@ bool RenderGpuRaymarchPreview(const ImVec2& min, const ImVec2& max, std::string*
         constants.crackWidth = settings.crack.width;
         constants.crackDepth = settings.crack.depth;
         constants.crackRoughness = settings.crack.roughness;
+        constants.isoValue = settings.outputMesh.isoValue;
         constants.cameraPosition[0] = basis.position.x;
         constants.cameraPosition[1] = basis.position.y;
         constants.cameraPosition[2] = basis.position.z;
@@ -1876,9 +1899,9 @@ void DrawViewportAxisGizmo(ImDrawList* drawList, const ImVec2& min, const ImVec2
     drawList->PopClipRect();
 }
 
-void DrawSurfaceTrianglePreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, const rock::SdfPreviewStats& sdf)
+void DrawMeshPreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, const rock::MeshData& mesh, bool showSurface, bool showWireframe)
 {
-    if (sdf.surfaceTriangles.empty())
+    if (mesh.vertices.empty() || mesh.triangles.empty() || (!showSurface && !showWireframe))
     {
         return;
     }
@@ -1887,11 +1910,19 @@ void DrawSurfaceTrianglePreview(ImDrawList* drawList, const ImVec2& min, const I
     const float viewportSize = std::min(max.x - min.x, max.y - min.y);
     const float scale = viewportSize * 1.20f * g_viewport.zoom;
 
-    for (const rock::SurfaceTriangle& triangle : sdf.surfaceTriangles)
+    for (const rock::MeshTriangle& triangle : mesh.triangles)
     {
-        const ImVec2 a = ProjectPreviewPoint(triangle.ax, triangle.ay, triangle.az, center, scale);
-        const ImVec2 b = ProjectPreviewPoint(triangle.bx, triangle.by, triangle.bz, center, scale);
-        const ImVec2 c = ProjectPreviewPoint(triangle.cx, triangle.cy, triangle.cz, center, scale);
+        if (triangle.a >= mesh.vertices.size() || triangle.b >= mesh.vertices.size() || triangle.c >= mesh.vertices.size())
+        {
+            continue;
+        }
+
+        const rock::MeshVertex& va = mesh.vertices[triangle.a];
+        const rock::MeshVertex& vb = mesh.vertices[triangle.b];
+        const rock::MeshVertex& vc = mesh.vertices[triangle.c];
+        const ImVec2 a = ProjectPreviewPoint(va.x, va.y, va.z, center, scale);
+        const ImVec2 b = ProjectPreviewPoint(vb.x, vb.y, vb.z, center, scale);
+        const ImVec2 c = ProjectPreviewPoint(vc.x, vc.y, vc.z, center, scale);
 
         if ((a.x < min.x && b.x < min.x && c.x < min.x) || (a.x > max.x && b.x > max.x && c.x > max.x) ||
             (a.y < min.y && b.y < min.y && c.y < min.y) || (a.y > max.y && b.y > max.y && c.y > max.y))
@@ -1899,8 +1930,44 @@ void DrawSurfaceTrianglePreview(ImDrawList* drawList, const ImVec2& min, const I
             continue;
         }
 
-        drawList->AddTriangleFilled(a, b, c, ThemeColor("surfaceFill", ImVec4(0.38f, 0.48f, 0.40f, 0.29f)));
-        drawList->AddTriangle(a, b, c, ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 0.8f);
+        if (showSurface)
+        {
+            drawList->AddTriangleFilled(a, b, c, ThemeColor("surfaceFill", ImVec4(0.38f, 0.48f, 0.40f, 0.29f)));
+        }
+        if (showWireframe)
+        {
+            drawList->AddTriangle(a, b, c, ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 0.8f);
+        }
+    }
+}
+
+void DrawMeshEdgePreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, const rock::MeshData& mesh)
+{
+    if (mesh.vertices.empty() || mesh.edges.empty())
+    {
+        return;
+    }
+
+    const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.5f + g_viewport.pan.y);
+    const float viewportSize = std::min(max.x - min.x, max.y - min.y);
+    const float scale = viewportSize * 1.20f * g_viewport.zoom;
+
+    for (const rock::MeshEdge& edge : mesh.edges)
+    {
+        if (edge.a >= mesh.vertices.size() || edge.b >= mesh.vertices.size())
+        {
+            continue;
+        }
+
+        const rock::MeshVertex& va = mesh.vertices[edge.a];
+        const rock::MeshVertex& vb = mesh.vertices[edge.b];
+        ImVec2 a = ProjectPreviewPoint(va.x, va.y, va.z, center, scale);
+        ImVec2 b = ProjectPreviewPoint(vb.x, vb.y, vb.z, center, scale);
+        if ((a.x < min.x && b.x < min.x) || (a.x > max.x && b.x > max.x) || (a.y < min.y && b.y < min.y) || (a.y > max.y && b.y > max.y))
+        {
+            continue;
+        }
+        drawList->AddLine(a, b, ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 0.9f);
     }
 }
 
@@ -1923,9 +1990,16 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     }
     if (g_ui.meshPreview)
     {
-        DrawSurfaceTrianglePreview(drawList, min, max, g_graph.Evaluation().previewSdf);
-        DrawSurfacePointPreview(drawList, min, max, g_graph.Evaluation().previewSdf);
-        DrawSurfaceWirePreview(drawList, min, max, g_graph.Evaluation().previewSdf);
+        const rock::OutputMeshSettings& outputMesh = g_graph.Settings().outputMesh;
+        DrawMeshPreview(drawList, min, max, g_graph.Evaluation().previewMesh, outputMesh.showSurface, false);
+        if (outputMesh.showPoints)
+        {
+            DrawSurfacePointPreview(drawList, min, max, g_graph.Evaluation().previewSdf);
+        }
+        if (outputMesh.showWireframe)
+        {
+            DrawMeshEdgePreview(drawList, min, max, g_graph.Evaluation().previewMesh);
+        }
     }
 
     const std::array<std::array<float, 3>, 8> vertices{{
@@ -1970,7 +2044,7 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     drawList->AddText(ImVec2(min.x + 16.0f, min.y + 14.0f), ThemeColor("accentText", ImVec4(0.86f, 0.88f, 0.85f, 1.0f)), title.c_str());
     drawList->AddText(ImVec2(min.x + 16.0f, min.y + 36.0f), ThemeColor("mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)), "Right-handed, Y-up, 10 x 10 m grid");
     DrawViewportAxisGizmo(drawList, min, max);
-    if (g_ui.meshPreview)
+    if (g_ui.meshPreview && g_graph.Settings().outputMesh.showSlice)
     {
         DrawSdfSliceOverlay(drawList, min, max, g_graph.Evaluation().previewSdf);
     }
@@ -2250,6 +2324,24 @@ bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minVa
     return editEnded;
 }
 
+bool DrawPropertyBoolRow(const char* label, const char* id, bool* value, const char* dirtyReason)
+{
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::TableSetColumnIndex(1);
+
+    ImGui::PushID(id);
+    const bool changed = ImGui::Checkbox("##value", value);
+    if (changed)
+    {
+        g_graph.MarkDirty(dirtyReason);
+    }
+    ImGui::PopID();
+    return changed;
+}
+
 void DrawCameraFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, const char* format = "%.2f")
 {
     ImGui::TableNextRow();
@@ -2351,7 +2443,49 @@ void DrawPropertiesPanel()
 
     if (selectedNode->kind == rock::NodeKind::OutputMesh)
     {
-        ImGui::TextWrapped("このノードは最終出力を表します。");
+        if (ImGui::BeginTable("OutputMeshPropertyRows", 2, ImGuiTableFlags_SizingStretchProp))
+        {
+            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+            if (DrawPropertyIntRow("Resolution", "OutputMeshResolution", &settings.outputMesh.resolution, 16, 96, "Output mesh resolution changed"))
+            {
+                EvaluateGraph();
+            }
+            if (DrawPropertyIntRow("LOD", "OutputMeshLod", &settings.outputMesh.lod, 0, 4, "Output mesh LOD changed"))
+            {
+                EvaluateGraph();
+            }
+            if (DrawPropertyFloatRow("Iso Value", "OutputMeshIsoValue", &settings.outputMesh.isoValue, -0.2f, 0.2f, "Output mesh iso value changed"))
+            {
+                EvaluateGraph();
+            }
+            int displayMode = static_cast<int>(settings.outputMesh.displayMode);
+            if (DrawPropertyComboRow("Display", "OutputMeshDisplay", &displayMode, "Mesh\0Voxels\0"))
+            {
+                settings.outputMesh.displayMode = static_cast<rock::MeshDisplayMode>(displayMode);
+                g_graph.MarkDirty("Output mesh display mode changed");
+                EvaluateGraph();
+            }
+            if (DrawPropertyBoolRow("Surface", "OutputMeshSurface", &settings.outputMesh.showSurface, "Output mesh surface visibility changed"))
+            {
+                EvaluateGraph();
+            }
+            if (DrawPropertyBoolRow("Wireframe", "OutputMeshWireframe", &settings.outputMesh.showWireframe, "Output mesh wireframe visibility changed"))
+            {
+                EvaluateGraph();
+            }
+            if (DrawPropertyBoolRow("Points", "OutputMeshPoints", &settings.outputMesh.showPoints, "Output mesh point visibility changed"))
+            {
+                EvaluateGraph();
+            }
+            if (DrawPropertyBoolRow("Slice", "OutputMeshSlice", &settings.outputMesh.showSlice, "Output mesh slice visibility changed"))
+            {
+                EvaluateGraph();
+            }
+
+            ImGui::EndTable();
+        }
         ImGui::Spacing();
         if (ImGui::Button("Build Mesh"))
         {
@@ -2366,8 +2500,8 @@ void DrawPropertiesPanel()
             }
 
             std::string error;
-            const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_debug.obj";
-            if (rock::ExportDebugTrianglesObj(g_graph.Evaluation().finalSdf, exportPath, &error))
+            const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_mesh.obj";
+            if (rock::ExportMeshObj(g_graph.Evaluation().finalMesh, exportPath, &error))
             {
                 g_exportStatus = "Exported " + exportPath.string();
             }
@@ -2462,16 +2596,22 @@ void DrawStatsPanel()
     ImGui::Text("Surface Points: %zu", previewSdf.surfacePoints.size());
     ImGui::Text("Surface Lines: %zu", previewSdf.surfaceSegments.size());
     ImGui::Text("Surface Triangles: %zu", previewSdf.surfaceTriangles.size());
+    ImGui::SeparatorText("Mesh Topology");
+    ImGui::Text("Vertices: %zu", evaluation.previewMesh.vertices.size());
+    ImGui::Text("Edges: %zu", evaluation.previewMesh.edges.size());
+    ImGui::Text("Triangles: %zu", evaluation.previewMesh.triangles.size());
 }
 
 void DrawAssetExportPanel()
 {
+    const rock::OutputMeshSettings& outputMesh = g_graph.Settings().outputMesh;
+    const int effectiveResolution = std::clamp(outputMesh.resolution / (1 << std::clamp(outputMesh.lod, 0, 4)), 16, 96);
     ImGui::Columns(4, nullptr, false);
     ImGui::TextUnformatted("High mesh");
-    ImGui::Text("%s", g_graph.Evaluation().dirty ? "needs evaluate" : "debug triangles");
+    ImGui::Text("%s", g_graph.Evaluation().dirty ? "needs evaluate" : "wire preview");
     ImGui::NextColumn();
     ImGui::TextUnformatted("LOD");
-    ImGui::TextUnformatted("0 generated");
+    ImGui::Text("%d / %d^3", outputMesh.lod, effectiveResolution);
     ImGui::NextColumn();
     ImGui::TextUnformatted("Textures");
     ImGui::TextUnformatted("normal / AO later");
@@ -2490,8 +2630,8 @@ void DrawAssetExportPanel()
         }
 
         std::string error;
-        const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_debug.obj";
-        if (rock::ExportDebugTrianglesObj(g_graph.Evaluation().finalSdf, exportPath, &error))
+        const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_mesh.obj";
+        if (rock::ExportMeshObj(g_graph.Evaluation().finalMesh, exportPath, &error))
         {
             g_exportStatus = "Exported " + exportPath.string();
         }
@@ -2683,8 +2823,8 @@ void DrawUi()
                 }
 
                 std::string error;
-                const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_debug.obj";
-                if (rock::ExportDebugTrianglesObj(g_graph.Evaluation().finalSdf, exportPath, &error))
+                const std::filesystem::path exportPath = std::filesystem::path("exports") / "rock_mesh.obj";
+                if (rock::ExportMeshObj(g_graph.Evaluation().finalMesh, exportPath, &error))
                 {
                     g_exportStatus = "Exported " + exportPath.string();
                 }

@@ -53,6 +53,12 @@ enum class ComputeBackend
     Auto,
 };
 
+enum class MeshDisplayMode
+{
+    Mesh,
+    Voxels,
+};
+
 struct Pin
 {
     GraphId id = 0;
@@ -97,11 +103,24 @@ struct CrackSettings
     float roughness = 0.65f;
 };
 
+struct OutputMeshSettings
+{
+    int resolution = 48;
+    int lod = 0;
+    float isoValue = 0.0f;
+    MeshDisplayMode displayMode = MeshDisplayMode::Mesh;
+    bool showSurface = true;
+    bool showWireframe = true;
+    bool showPoints = false;
+    bool showSlice = true;
+};
+
 struct GraphSettings
 {
     PrimitiveSettings primitive;
     NoiseSettings noise;
     CrackSettings crack;
+    OutputMeshSettings outputMesh;
     ComputeBackend previewBackend = ComputeBackend::Cpu;
 };
 
@@ -136,6 +155,36 @@ struct SurfaceTriangle
     float cz = 0.0f;
 };
 
+struct MeshVertex
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float nx = 0.0f;
+    float ny = 1.0f;
+    float nz = 0.0f;
+};
+
+struct MeshTriangle
+{
+    uint32_t a = 0;
+    uint32_t b = 0;
+    uint32_t c = 0;
+};
+
+struct MeshEdge
+{
+    uint32_t a = 0;
+    uint32_t b = 0;
+};
+
+struct MeshData
+{
+    std::vector<MeshVertex> vertices;
+    std::vector<MeshTriangle> triangles;
+    std::vector<MeshEdge> edges;
+};
+
 struct SdfPreviewStats
 {
     int resolution = 0;
@@ -164,6 +213,8 @@ struct EvaluationSummary
     bool previewBackendFallback = false;
     SdfPreviewStats previewSdf;
     SdfPreviewStats finalSdf;
+    MeshData previewMesh;
+    MeshData finalMesh;
 };
 
 class NodeGraph
@@ -212,6 +263,7 @@ std::string_view ToString(NodeKind kind);
 std::string_view ToString(PreviewStage stage);
 std::string_view ToString(ValueType type);
 std::string_view ToString(ComputeBackend backend);
+std::string_view ToString(MeshDisplayMode mode);
 PreviewStage PreviewStageFor(NodeKind kind);
 
 } // namespace rock

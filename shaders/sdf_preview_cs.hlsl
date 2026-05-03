@@ -9,7 +9,7 @@ cbuffer Settings : register(b0)
     float crackWidth;
     float crackDepth;
     float crackRoughness;
-    float padding0;
+    float isoValue;
     float padding1;
     float padding2;
 };
@@ -131,6 +131,8 @@ void main(uint3 id : SV_DispatchThreadID)
         sdf = apply_noise(sdf, p);
     if (previewStage >= 2)
         sdf = apply_cracks(sdf, p);
+    if (previewStage >= 3)
+        sdf -= isoValue;
 
     gSdf[grid_index(id.x, id.y, id.z)] = sdf;
 }
