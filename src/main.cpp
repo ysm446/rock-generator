@@ -82,6 +82,7 @@ rock::NodeGraph g_graph = rock::NodeGraph::CreateDefaultRockGraph();
 std::string g_exportStatus = "No export yet";
 std::string g_projectStatus = "No project file";
 std::filesystem::path g_projectPath;
+std::wstring g_windowTitle;
 std::vector<std::filesystem::path> g_recentProjectPaths;
 std::vector<std::pair<rock::GraphId, ImVec2>> g_pendingNodePositions;
 std::vector<std::pair<rock::GraphId, ImVec2>> g_nodePositionCache;
@@ -248,8 +249,10 @@ void UpdateWindowTitle()
 {
     if (g_hwnd != nullptr)
     {
-        const std::string title = MakeWindowTitleText();
-        SetWindowTextA(g_hwnd, title.c_str());
+        g_windowTitle = MakeWindowTitle();
+        // nvspcap64.dll (NVIDIA Shadowplay) hooks SetWindowTextA/W and truncates to
+        // first character. Call DefWindowProcW directly to bypass the IAT hook.
+        DefWindowProcW(g_hwnd, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(g_windowTitle.c_str()));
     }
 }
 
@@ -3469,6 +3472,12 @@ LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     switch (msg)
     {
+    case WM_SETTEXT:
+        if (!g_windowTitle.empty())
+        {
+            return DefWindowProcW(hwnd, WM_SETTEXT, wParam, reinterpret_cast<LPARAM>(g_windowTitle.c_str()));
+        }
+        break;
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED)
         {
@@ -3513,12 +3522,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         {
             throw std::runtime_error("CreateWindow failed");
         }
-        UpdateWindowTitle();
-
         InitD3D(g_hwnd);
 
         ShowWindow(g_hwnd, showCommand);
         UpdateWindow(g_hwnd);
+        UpdateWindowTitle();
 
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
