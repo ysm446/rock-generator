@@ -43,6 +43,7 @@ namespace
 {
 constexpr int kFrameCount = 2;
 constexpr int kSrvDescriptorCount = 64;
+constexpr float kFullFrameSensorHeightMm = 24.0f;
 
 struct FrameContext
 {
@@ -704,10 +705,36 @@ std::filesystem::path NormalizedProjectPath(const std::filesystem::path& path)
     return std::filesystem::absolute(path).lexically_normal();
 }
 
+bool ProjectPathExists(const std::filesystem::path& path)
+{
+    std::error_code error;
+    return std::filesystem::exists(path, error);
+}
+
+bool PruneMissingRecentProjectPaths()
+{
+    const auto missing = std::remove_if(g_recentProjectPaths.begin(), g_recentProjectPaths.end(), [](const std::filesystem::path& recentPath) {
+        return !ProjectPathExists(recentPath);
+    });
+    if (missing == g_recentProjectPaths.end())
+    {
+        return false;
+    }
+
+    g_recentProjectPaths.erase(missing, g_recentProjectPaths.end());
+    return true;
+}
+
 void AddRecentProjectPath(const std::filesystem::path& path)
 {
     constexpr size_t kMaxRecentProjects = 8;
     const std::filesystem::path normalized = NormalizedProjectPath(path);
+    if (!ProjectPathExists(normalized))
+    {
+        return;
+    }
+
+    PruneMissingRecentProjectPaths();
     const auto existing = std::remove_if(g_recentProjectPaths.begin(), g_recentProjectPaths.end(), [&](const std::filesystem::path& recentPath) {
         return NormalizedProjectPath(recentPath) == normalized;
     });
@@ -741,11 +768,39 @@ std::filesystem::path AppSettingsPath()
     return DataDirectory() / "app_settings.json";
 }
 
+void LoadSavedWindowSize()
+{
+    try
+    {
+        const std::filesystem::path path = AppSettingsPath();
+        if (!std::filesystem::exists(path))
+        {
+            return;
+        }
+
+        std::ifstream stream(path);
+        if (!stream)
+        {
+            return;
+        }
+
+        nlohmann::json root;
+        stream >> root;
+        const nlohmann::json windowJson = root.value("window", nlohmann::json::object());
+        g_width = static_cast<UINT>(std::clamp(windowJson.value("width", static_cast<int>(g_width)), 640, 7680));
+        g_height = static_cast<UINT>(std::clamp(windowJson.value("height", static_cast<int>(g_height)), 480, 4320));
+    }
+    catch (...)
+    {
+    }
+}
+
 bool SaveAppSettings(std::string* error = nullptr)
 {
     try
     {
         const rock::GraphSettings& settings = g_graph.Settings();
+        PruneMissingRecentProjectPaths();
         nlohmann::json root;
         root["format"] = "rock_generator_app_settings";
         root["formatVersion"] = 1;
@@ -773,9 +828,17 @@ bool SaveAppSettings(std::string* error = nullptr)
             {"rightPaneWidth", g_ui.rightPaneWidth},
             {"nodePaneHeight", g_ui.nodePaneHeight},
         };
+        root["window"] = {
+            {"width", g_width},
+            {"height", g_height},
+        };
         root["recentProjects"] = nlohmann::json::array();
         for (const std::filesystem::path& recentPath : g_recentProjectPaths)
         {
+            if (!ProjectPathExists(recentPath))
+            {
+                continue;
+            }
             root["recentProjects"].push_back(PathToUtf8(recentPath));
         }
         root["viewport"] = {
@@ -873,6 +936,10 @@ bool LoadAppSettings(std::string* error = nullptr)
         const nlohmann::json layoutJson = root.value("layout", nlohmann::json::object());
         g_ui.rightPaneWidth = std::max(0.0f, layoutJson.value("rightPaneWidth", g_ui.rightPaneWidth));
         g_ui.nodePaneHeight = std::max(0.0f, layoutJson.value("nodePaneHeight", g_ui.nodePaneHeight));
+
+        const nlohmann::json windowJson = root.value("window", nlohmann::json::object());
+        g_width = static_cast<UINT>(std::clamp(windowJson.value("width", static_cast<int>(g_width)), 640, 7680));
+        g_height = static_cast<UINT>(std::clamp(windowJson.value("height", static_cast<int>(g_height)), 480, 4320));
 
         g_recentProjectPaths.clear();
         if (root.contains("recentProjects") && root["recentProjects"].is_array())
@@ -1716,6 +1783,21 @@ void ResetViewport()
     g_viewport.fovDegrees = 45.0f;
     g_viewport.orbitDistance = 8.0f;
     g_viewport.zoom = 1.0f;
+}
+
+float CameraFocalLengthMmFromFovYDegrees(float fovYDegrees)
+{
+    const float clampedFovYDegrees = std::clamp(fovYDegrees, 15.0f, 90.0f);
+    const float fovRadians = clampedFovYDegrees * 3.1415926535f / 180.0f;
+    return kFullFrameSensorHeightMm / (2.0f * std::tan(fovRadians * 0.5f));
+}
+
+float CameraFovYDegreesFromFocalLengthMm(float focalLengthMm)
+{
+    const float defaultFocalLengthMm = CameraFocalLengthMmFromFovYDegrees(45.0f);
+    const float clampedFocalLengthMm = std::max(0.1f, std::isfinite(focalLengthMm) ? focalLengthMm : defaultFocalLengthMm);
+    const float fovRadians = 2.0f * std::atan(kFullFrameSensorHeightMm / (2.0f * clampedFocalLengthMm));
+    return std::clamp(fovRadians * 180.0f / 3.1415926535f, 15.0f, 90.0f);
 }
 
 void UpdateViewportInteraction(const ImVec2& min, const ImVec2& max)
@@ -2987,12 +3069,14 @@ void DrawRockNode(const rock::Node& node)
     DrawNodeIcon(headerCursor, accent);
     ImGui::Dummy(ImVec2(28.0f, 20.0f));
     ImGui::SameLine();
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 1.0f);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 1.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.88f, 0.88f, 1.0f));
+    ImGui::SetWindowFontScale(1.10f);
     ImGui::TextUnformatted(node.title.c_str());
+    ImGui::SetWindowFontScale(1.0f);
     ImGui::PopStyleColor();
 
-    ImGui::Dummy(ImVec2(nodeWidth, 8.0f));
+    ImGui::Dummy(ImVec2(nodeWidth, 10.0f));
     const float rowStartX = ImGui::GetCursorPosX();
     const float rowY = ImGui::GetCursorPosY();
 
@@ -3574,8 +3658,9 @@ bool DrawColorRgbRow(const char* label, const char* id, std::array<float, 3>& va
     return changed;
 }
 
-void DrawCameraFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, float defaultValue, const char* format = "%.2f")
+bool DrawCameraFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, float defaultValue, const char* format = "%.2f")
 {
+    bool changed = false;
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
     ImGui::AlignTextToFramePadding();
@@ -3591,18 +3676,21 @@ void DrawCameraFloatRow(const char* label, const char* id, float* value, float m
         80.0f,
         180.0f);
     ImGui::SetNextItemWidth(sliderWidth);
-    ImGui::SliderFloat("##slider", value, minValue, maxValue, format);
+    changed = ImGui::SliderFloat("##slider", value, minValue, maxValue, format) || changed;
     ImGui::SameLine();
     ImGui::SetNextItemWidth(inputWidth);
     if (ImGui::InputFloat("##number", value, 0.0f, 0.0f, format))
     {
         *value = std::clamp(*value, minValue, maxValue);
+        changed = true;
     }
     if (DrawResetToDefaultButton("reset"))
     {
         *value = std::clamp(defaultValue, minValue, maxValue);
+        changed = true;
     }
     ImGui::PopID();
+    return changed;
 }
 
 void DrawPropertiesPanel()
@@ -3800,6 +3888,11 @@ void DrawCameraPanel()
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
 
         DrawCameraFloatRow("FOV", "FovDegrees", &g_viewport.fovDegrees, 15.0f, 90.0f, 45.0f, "%.1f");
+        float focalLengthMm = CameraFocalLengthMmFromFovYDegrees(g_viewport.fovDegrees);
+        if (DrawCameraFloatRow("焦点距離 (mm)", "FocalLengthMm", &focalLengthMm, 1.0f, 200.0f, CameraFocalLengthMmFromFovYDegrees(45.0f), "%.1f"))
+        {
+            g_viewport.fovDegrees = CameraFovYDegreesFromFocalLengthMm(focalLengthMm);
+        }
         DrawCameraFloatRow("Distance", "OrbitDistance", &g_viewport.orbitDistance, 1.0f, 40.0f, 8.0f, "%.2f");
         DrawCameraFloatRow("Zoom", "ViewportZoom", &g_viewport.zoom, 0.35f, 4.0f, 1.0f, "%.2f");
         DrawCameraFloatRow("Yaw", "ViewportYaw", &g_viewport.yaw, -3.14159f, 3.14159f, 0.0f, "%.3f");
@@ -4075,6 +4168,10 @@ void DrawUi()
                         g_projectStatus = "Save failed: " + error;
                     }
                 }
+            }
+            if (PruneMissingRecentProjectPaths())
+            {
+                SaveAppSettingsSilently();
             }
             if (ImGui::BeginMenu("最近使ったファイル", !g_recentProjectPaths.empty()))
             {
@@ -4453,6 +4550,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         wc.lpszClassName = L"RockGeneratorWindow";
         RegisterClassExW(&wc);
 
+        LoadSavedWindowSize();
         RECT rect{0, 0, static_cast<LONG>(g_width), static_cast<LONG>(g_height)};
         AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
         const std::wstring windowTitle = L"Rock Generator";
