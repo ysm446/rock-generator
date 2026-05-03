@@ -85,13 +85,36 @@ UiState g_ui;
 
 struct ViewportState
 {
-    float yaw = 0.65f;
-    float pitch = 0.42f;
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float fovDegrees = 45.0f;
+    float orbitDistance = 8.0f;
     float zoom = 1.0f;
     ImVec2 pan = ImVec2(0.0f, 0.0f);
 };
 
 ViewportState g_viewport;
+
+struct Vec3
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+struct CameraBasis
+{
+    Vec3 position;
+    Vec3 right;
+    Vec3 up;
+    Vec3 forward;
+};
+
+struct ProjectedPoint
+{
+    ImVec2 screen;
+    float depth = 0.0f;
+};
 
 std::wstring MakeWindowTitle()
 {
@@ -308,8 +331,10 @@ void CleanupD3D()
 void ResetViewport()
 {
     g_viewport = {};
-    g_viewport.yaw = 0.65f;
-    g_viewport.pitch = 0.42f;
+    g_viewport.yaw = 0.0f;
+    g_viewport.pitch = 0.0f;
+    g_viewport.fovDegrees = 45.0f;
+    g_viewport.orbitDistance = 8.0f;
     g_viewport.zoom = 1.0f;
 }
 
@@ -336,7 +361,7 @@ void UpdateViewportInteraction(const ImVec2& min, const ImVec2& max)
 
     if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && hovered)
     {
-        g_viewport.yaw += io.MouseDelta.x * 0.010f;
+        g_viewport.yaw -= io.MouseDelta.x * 0.010f;
         g_viewport.pitch += io.MouseDelta.y * 0.010f;
         g_viewport.pitch = std::clamp(g_viewport.pitch, -1.25f, 1.25f);
     }
@@ -348,18 +373,87 @@ void UpdateViewportInteraction(const ImVec2& min, const ImVec2& max)
     }
 }
 
-ImVec2 RotatePoint(float x, float y, float z, float yaw, float pitch)
+Vec3 Subtract(Vec3 a, Vec3 b)
 {
-    const float ca = std::cos(yaw);
-    const float sa = std::sin(yaw);
-    const float xz = x * ca - z * sa;
-    const float zz = x * sa + z * ca;
-    const float cy = std::cos(pitch);
-    const float sy = std::sin(pitch);
-    const float yz = y * cy - zz * sy;
-    const float depth = y * sy + zz * cy + 3.5f;
-    const float perspective = 1.0f / depth;
-    return ImVec2(xz * perspective, yz * perspective);
+    return Vec3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+Vec3 Scale(Vec3 value, float scalar)
+{
+    return Vec3(value.x * scalar, value.y * scalar, value.z * scalar);
+}
+
+float Dot(Vec3 a, Vec3 b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+Vec3 Cross(Vec3 a, Vec3 b)
+{
+    return Vec3(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x);
+}
+
+Vec3 Normalize(Vec3 value, Vec3 fallback)
+{
+    const float lengthSq = Dot(value, value);
+    if (lengthSq <= 0.000001f)
+    {
+        return fallback;
+    }
+    return Scale(value, 1.0f / std::sqrt(lengthSq));
+}
+
+CameraBasis BuildCameraBasis()
+{
+    const float distance = std::clamp(g_viewport.orbitDistance, 1.0f, 40.0f);
+    const float cosPitch = std::cos(g_viewport.pitch);
+    const float sinPitch = std::sin(g_viewport.pitch);
+    const float cosYaw = std::cos(g_viewport.yaw);
+    const float sinYaw = std::sin(g_viewport.yaw);
+    const Vec3 worldUp(0.0f, 1.0f, 0.0f);
+
+    CameraBasis basis;
+    basis.position = Vec3(sinYaw * cosPitch * distance, sinPitch * distance, cosYaw * cosPitch * distance);
+    basis.forward = Normalize(Scale(basis.position, -1.0f), Vec3(0.0f, 0.0f, -1.0f));
+    basis.right = Normalize(Cross(basis.forward, worldUp), Vec3(1.0f, 0.0f, 0.0f));
+    basis.up = Normalize(Cross(basis.right, basis.forward), worldUp);
+    return basis;
+}
+
+ImVec2 ProjectWorldNormalized(float x, float y, float z)
+{
+    const CameraBasis basis = BuildCameraBasis();
+    const Vec3 world(x, y, z);
+    const Vec3 view = Subtract(world, basis.position);
+    const float cameraX = Dot(view, basis.right);
+    const float cameraY = Dot(view, basis.up);
+    const float depth = std::max(0.05f, Dot(view, basis.forward));
+    const float fovRadians = std::clamp(g_viewport.fovDegrees, 15.0f, 90.0f) * 3.1415926535f / 180.0f;
+    const float focalLength = 1.0f / std::tan(fovRadians * 0.5f);
+    const float perspective = focalLength / depth;
+    return ImVec2(cameraX * perspective, -cameraY * perspective);
+}
+
+ProjectedPoint ProjectWorldToScreen(float x, float y, float z, const ImVec2& center, float scale)
+{
+    const CameraBasis basis = BuildCameraBasis();
+    const Vec3 world(x, y, z);
+    const Vec3 view = Subtract(world, basis.position);
+    const float cameraX = Dot(view, basis.right);
+    const float cameraY = Dot(view, basis.up);
+    const float depth = std::max(0.05f, Dot(view, basis.forward));
+    const float fovRadians = std::clamp(g_viewport.fovDegrees, 15.0f, 90.0f) * 3.1415926535f / 180.0f;
+    const float focalLength = 1.0f / std::tan(fovRadians * 0.5f);
+    const float perspective = focalLength / depth;
+    return ProjectedPoint(ImVec2(center.x + cameraX * perspective * scale, center.y - cameraY * perspective * scale), depth);
+}
+
+ImVec2 RotatePoint(float x, float y, float z, float, float)
+{
+    return ProjectWorldNormalized(x, y, z);
 }
 
 ImU32 ColorToU32(const ImVec4& color);
@@ -420,9 +514,9 @@ void DrawSurfacePointPreview(ImDrawList* drawList, const ImVec2& min, const ImVe
         return;
     }
 
-    const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.52f + g_viewport.pan.y);
+    const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.5f + g_viewport.pan.y);
     const float viewportSize = std::min(max.x - min.x, max.y - min.y);
-    const float scale = viewportSize * 1.18f * g_viewport.zoom;
+    const float scale = viewportSize * 1.20f * g_viewport.zoom;
 
     for (const rock::SurfacePoint& point : sdf.surfacePoints)
     {
@@ -446,9 +540,9 @@ void DrawSurfaceWirePreview(ImDrawList* drawList, const ImVec2& min, const ImVec
         return;
     }
 
-    const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.52f + g_viewport.pan.y);
+    const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.5f + g_viewport.pan.y);
     const float viewportSize = std::min(max.x - min.x, max.y - min.y);
-    const float scale = viewportSize * 1.18f * g_viewport.zoom;
+    const float scale = viewportSize * 1.20f * g_viewport.zoom;
 
     for (const rock::SurfaceSegment& segment : sdf.surfaceSegments)
     {
@@ -472,6 +566,79 @@ ImVec2 ProjectPreviewPoint(float x, float y, float z, const ImVec2& center, floa
     return ImVec2(center.x + p.x * scale, center.y + p.y * scale);
 }
 
+void DrawViewportGrid3D(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, const ImVec2& center, float scale)
+{
+    const ImU32 minorColor = ThemeColor("viewportGrid", ImVec4(0.24f, 0.27f, 0.25f, 0.35f));
+    const ImU32 axisXColor = IM_COL32(210, 76, 76, 210);
+    const ImU32 axisZColor = IM_COL32(76, 130, 220, 210);
+    constexpr int halfCellCount = 5;
+    constexpr float cellSizeMeters = 1.0f;
+
+    drawList->PushClipRect(min, max, true);
+    for (int i = -halfCellCount; i <= halfCellCount; ++i)
+    {
+        const float offset = static_cast<float>(i) * cellSizeMeters;
+        const ImVec2 xLineA = ProjectPreviewPoint(-halfCellCount * cellSizeMeters, 0.0f, offset, center, scale);
+        const ImVec2 xLineB = ProjectPreviewPoint(halfCellCount * cellSizeMeters, 0.0f, offset, center, scale);
+        const ImVec2 zLineA = ProjectPreviewPoint(offset, 0.0f, -halfCellCount * cellSizeMeters, center, scale);
+        const ImVec2 zLineB = ProjectPreviewPoint(offset, 0.0f, halfCellCount * cellSizeMeters, center, scale);
+        drawList->AddLine(xLineA, xLineB, i == 0 ? axisXColor : minorColor, i == 0 ? 1.8f : 1.0f);
+        drawList->AddLine(zLineA, zLineB, i == 0 ? axisZColor : minorColor, i == 0 ? 1.8f : 1.0f);
+    }
+    drawList->PopClipRect();
+}
+
+void DrawViewportAxisGizmo(ImDrawList* drawList, const ImVec2& min, const ImVec2& max)
+{
+    const ImVec2 center(min.x + 58.0f, max.y - 58.0f);
+    constexpr float axisLength = 30.0f;
+
+    struct AxisLine
+    {
+        const char* label;
+        ImU32 color;
+        ImVec2 dir;
+        float depth;
+    };
+
+    auto projectDirection = [](float x, float y, float z) {
+        const CameraBasis basis = BuildCameraBasis();
+        const Vec3 axis(x, y, z);
+        ImVec2 dir(Dot(axis, basis.right), -Dot(axis, basis.up));
+        const float length = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+        if (length > 0.0001f)
+        {
+            dir.x /= length;
+            dir.y /= length;
+        }
+        return std::pair<ImVec2, float>(dir, Dot(axis, basis.forward));
+    };
+
+    const auto [xDir, xDepth] = projectDirection(1.0f, 0.0f, 0.0f);
+    const auto [yDir, yDepth] = projectDirection(0.0f, 1.0f, 0.0f);
+    const auto [zDir, zDepth] = projectDirection(0.0f, 0.0f, 1.0f);
+    std::array<AxisLine, 3> axes{{
+        {"X", IM_COL32(255, 90, 90, 255), xDir, xDepth},
+        {"Y", IM_COL32(90, 255, 120, 255), yDir, yDepth},
+        {"Z", IM_COL32(90, 160, 255, 255), zDir, zDepth},
+    }};
+
+    std::ranges::sort(axes, [](const AxisLine& a, const AxisLine& b) {
+        return a.depth < b.depth;
+    });
+
+    drawList->PushClipRect(min, max, true);
+    drawList->AddCircleFilled(center, 4.0f, IM_COL32(235, 235, 235, 220), 16);
+    for (const AxisLine& axis : axes)
+    {
+        const ImVec2 end(center.x + axis.dir.x * axisLength, center.y + axis.dir.y * axisLength);
+        const float thickness = axis.depth >= 0.0f ? 2.6f : 1.8f;
+        drawList->AddLine(center, end, axis.color, thickness);
+        drawList->AddText(ImVec2(end.x + 8.0f, end.y - 8.0f), axis.color, axis.label);
+    }
+    drawList->PopClipRect();
+}
+
 void DrawSurfaceTrianglePreview(ImDrawList* drawList, const ImVec2& min, const ImVec2& max, const rock::SdfPreviewStats& sdf)
 {
     if (sdf.surfaceTriangles.empty())
@@ -479,9 +646,9 @@ void DrawSurfaceTrianglePreview(ImDrawList* drawList, const ImVec2& min, const I
         return;
     }
 
-    const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.52f + g_viewport.pan.y);
+    const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.5f + g_viewport.pan.y);
     const float viewportSize = std::min(max.x - min.x, max.y - min.y);
-    const float scale = viewportSize * 1.18f * g_viewport.zoom;
+    const float scale = viewportSize * 1.20f * g_viewport.zoom;
 
     for (const rock::SurfaceTriangle& triangle : sdf.surfaceTriangles)
     {
@@ -508,18 +675,10 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     const ImVec2 center((min.x + max.x) * 0.5f + g_viewport.pan.x, (min.y + max.y) * 0.5f + g_viewport.pan.y);
     const float viewportSize = std::min(max.x - min.x, max.y - min.y);
-    const float scale = viewportSize * 1.35f * g_viewport.zoom;
+    const float scale = viewportSize * 1.20f * g_viewport.zoom;
 
     drawList->AddRectFilled(min, max, ThemeColor("viewportBg", ImVec4(0.09f, 0.10f, 0.11f, 1.0f)));
-
-    const ImU32 gridColor = ThemeColor("viewportGrid", ImVec4(0.24f, 0.27f, 0.25f, 0.35f));
-    for (int i = 1; i < 8; ++i)
-    {
-        const float x = min.x + (max.x - min.x) * (static_cast<float>(i) / 8.0f);
-        const float y = min.y + (max.y - min.y) * (static_cast<float>(i) / 8.0f);
-        drawList->AddLine(ImVec2(x, min.y), ImVec2(x, max.y), gridColor);
-        drawList->AddLine(ImVec2(min.x, y), ImVec2(max.x, y), gridColor);
-    }
+    DrawViewportGrid3D(drawList, min, max, center, scale);
 
     DrawSurfaceTrianglePreview(drawList, min, max, g_graph.Evaluation().previewSdf);
     DrawSurfacePointPreview(drawList, min, max, g_graph.Evaluation().previewSdf);
@@ -536,11 +695,10 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
         {{-0.6f,  0.6f,  0.6f}},
     }};
 
-    std::array<ImVec2, 8> projected{};
+    std::array<ProjectedPoint, 8> projected{};
     for (size_t i = 0; i < vertices.size(); ++i)
     {
-        ImVec2 p = RotatePoint(vertices[i][0], vertices[i][1], vertices[i][2], g_viewport.yaw, g_viewport.pitch);
-        projected[i] = ImVec2(center.x + p.x * scale, center.y + p.y * scale);
+        projected[i] = ProjectWorldToScreen(vertices[i][0], vertices[i][1], vertices[i][2], center, scale);
     }
 
     const std::array<std::array<int, 2>, 12> edges{{
@@ -549,14 +707,25 @@ void DrawViewportCube(const ImVec2& min, const ImVec2& max, float timeSeconds)
         {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
     }};
 
+    const float centerDepth = ProjectWorldToScreen(0.0f, 0.0f, 0.0f, center, scale).depth;
+    const ImVec4 wireBase = g_themeManager.AppColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f));
+    drawList->PushClipRect(min, max, true);
     for (const auto& edge : edges)
     {
-        drawList->AddLine(projected[edge[0]], projected[edge[1]], ThemeColor("surfaceWire", ImVec4(0.80f, 0.84f, 0.75f, 0.53f)), 2.0f);
+        const ProjectedPoint& a = projected[edge[0]];
+        const ProjectedPoint& b = projected[edge[1]];
+        const float avgDepth = (a.depth + b.depth) * 0.5f;
+        const bool nearEdge = avgDepth <= centerDepth;
+        const float alpha = nearEdge ? 0.68f : 0.24f;
+        const float thickness = nearEdge ? 1.8f : 1.0f;
+        drawList->AddLine(a.screen, b.screen, ColorToU32(ImVec4(wireBase.x, wireBase.y, wireBase.z, alpha)), thickness);
     }
+    drawList->PopClipRect();
 
     const std::string title = "SDF Preview: " + std::string(rock::ToString(g_graph.Preview()));
     drawList->AddText(ImVec2(min.x + 16.0f, min.y + 14.0f), ThemeColor("accentText", ImVec4(0.86f, 0.88f, 0.85f, 1.0f)), title.c_str());
-    drawList->AddText(ImVec2(min.x + 16.0f, min.y + 36.0f), ThemeColor("mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)), "Debug triangles from dense SDF");
+    drawList->AddText(ImVec2(min.x + 16.0f, min.y + 36.0f), ThemeColor("mutedText", ImVec4(0.54f, 0.59f, 0.56f, 1.0f)), "Right-handed, Y-up, 10 x 10 m grid");
+    DrawViewportAxisGizmo(drawList, min, max);
     DrawSdfSliceOverlay(drawList, min, max, g_graph.Evaluation().previewSdf);
 }
 
@@ -834,6 +1003,28 @@ bool DrawPropertyIntRow(const char* label, const char* id, int* value, int minVa
     return editEnded;
 }
 
+void DrawCameraFloatRow(const char* label, const char* id, float* value, float minValue, float maxValue, const char* format = "%.2f")
+{
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::TableSetColumnIndex(1);
+
+    ImGui::PushID(id);
+    const float inputWidth = 76.0f;
+    const float sliderWidth = std::max(80.0f, ImGui::GetContentRegionAvail().x - inputWidth - ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::SetNextItemWidth(sliderWidth);
+    ImGui::SliderFloat("##slider", value, minValue, maxValue, format);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(inputWidth);
+    if (ImGui::InputFloat("##number", value, 0.0f, 0.0f, format))
+    {
+        *value = std::clamp(*value, minValue, maxValue);
+    }
+    ImGui::PopID();
+}
+
 void DrawPropertiesPanel()
 {
     const rock::Node* selectedNode = g_graph.FindNode(g_selectedNodeId);
@@ -940,6 +1131,33 @@ void DrawPropertiesPanel()
         }
         ImGui::TextWrapped("%s", g_exportStatus.c_str());
     }
+}
+
+void DrawCameraPanel()
+{
+    if (ImGui::Button("Reset View"))
+    {
+        ResetViewport();
+    }
+
+    ImGui::Spacing();
+    if (ImGui::BeginTable("CameraRows", 2, ImGuiTableFlags_SizingStretchProp))
+    {
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 112.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+
+        DrawCameraFloatRow("FOV", "FovDegrees", &g_viewport.fovDegrees, 15.0f, 90.0f, "%.1f");
+        DrawCameraFloatRow("Distance", "OrbitDistance", &g_viewport.orbitDistance, 1.0f, 40.0f, "%.2f");
+        DrawCameraFloatRow("Zoom", "ViewportZoom", &g_viewport.zoom, 0.35f, 4.0f, "%.2f");
+        DrawCameraFloatRow("Yaw", "ViewportYaw", &g_viewport.yaw, -3.14159f, 3.14159f, "%.3f");
+        DrawCameraFloatRow("Pitch", "ViewportPitch", &g_viewport.pitch, -1.25f, 1.25f, "%.3f");
+
+        ImGui::EndTable();
+    }
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Right-handed / Y-up");
+    ImGui::TextDisabled("Grid: 10 x 10 m, 1 m cells");
 }
 
 void DrawStatsPanel()
@@ -1171,6 +1389,11 @@ void DrawUi()
         if (ImGui::BeginTabItem("統計"))
         {
             DrawStatsPanel();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("カメラ"))
+        {
+            DrawCameraPanel();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
